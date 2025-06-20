@@ -76,7 +76,6 @@ def _dpo_loss_fwd_kernel(
     REJECTED_LOGPS,
     LSE,
     TEMPERATURE,
-    BETA: tl.constexpr,
     USE_REF_MODEL: tl.constexpr,
     L: tl.constexpr,
     N: tl.constexpr,
@@ -154,78 +153,6 @@ def _dpo_loss_fwd_kernel(
         tl.atomic_add(REJECTED_LOGPS, log_ratio)
 
 
-@triton.jit
-def _dpo_loss_bwd_kernel(
-    DLOSS,
-    DLOGITS,
-    LOGITS,
-    REF_LOGITS,
-    INPUT_IDS,
-    COMPLETION_MASK,
-    LSE,
-    CHOSEN_REWARDS,
-    REJECTED_REWARDS,
-    TEMPERATURE,
-    BETA: tl.constexpr,
-    USE_REF_MODEL: tl.constexpr,
-    loss_stride0,
-    loss_stride1,
-    L: tl.constexpr,
-    N: tl.constexpr,
-    BLOCK_N: tl.constexpr = 4096,
-):
-    """DPO loss backward kernel (adapted from GRPO pattern)"""
-    off_b = tl.program_id(0).cast(tl.int64)
-    off_l = tl.program_id(1).cast(tl.int64)
-
-    DLOGITS += off_b * (L + 1) * N + off_l * N
-
-    # Check completion mask
-    if COMPLETION_MASK is not None:
-        COMPLETION_MASK += off_b * L + off_l
-        not_skip = tl.load(COMPLETION_MASK)
-        if not_skip == 0:
-            # Zero out gradients for masked positions
-            for start in range(0, N, BLOCK_N):
-                cols = tl.arange(0, BLOCK_N) + start
-                tl.store(DLOGITS + cols, 0.0, mask=cols < N)
-            return
-
-    # Set up pointers
-    LOGITS += off_b * (L + 1) * N + off_l * N
-    DLOSS += off_b * loss_stride0 + off_l * loss_stride1
-    INPUT_IDS += off_b * L + off_l
-    LSE += off_b * L + off_l
-
-    # Load values
-    dloss = tl.load(DLOSS).to(tl.float32)
-    lse = tl.load(LSE).to(tl.float32)
-    idx = tl.load(INPUT_IDS)
-
-    # Determine pair and get corresponding reward gradient
-    pair_idx = off_b // 2
-    is_chosen = off_b % 2 == 0
-
-    if is_chosen:
-        CHOSEN_REWARDS += pair_idx
-        reward_grad = tl.load(CHOSEN_REWARDS).to(tl.float32)
-    else:
-        REJECTED_REWARDS += pair_idx
-        reward_grad = tl.load(REJECTED_REWARDS).to(tl.float32)
-
-    # Compute gradient w.r.t. log probability
-    dlogp = reward_grad * dloss / TEMPERATURE
-
-    # Compute gradients for all logits using softmax gradient (fixed range -> tl.range)
-    tl.debug_barrier()
-    for start_n in tl.range(0, N, BLOCK_N):
-        cols = start_n + tl.arange(0, BLOCK_N)
-        logits = tl.load(LOGITS + cols, mask=cols < N, other=-float("inf")).to(tl.float32) / TEMPERATURE
-        probs = tl.exp(logits - lse)
-        dlogits = tl.where(cols == idx, 1 - probs, -probs) * dlogp
-        tl.store(DLOGITS + cols, dlogits, mask=cols < N)
-
-
 class DPOLossFunction(torch.autograd.Function):
     """Memory-efficient Triton-based DPO Loss Function (following GRPO pattern)"""
 
@@ -283,7 +210,6 @@ class DPOLossFunction(torch.autograd.Function):
             rejected_logps,
             lse,
             temperature,
-            beta,  # BETA: tl.constexpr
             use_ref_model,  # USE_REF_MODEL: tl.constexpr
             L,  # L: tl.constexpr
             N,  # N: tl.constexpr
@@ -319,15 +245,14 @@ class DPOLossFunction(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output, grad_chosen_rewards, grad_rejected_rewards):
-        """Backward pass using Triton kernel (following GRPO pattern)"""
+        """Backward pass using PyTorch autograd (simpler than Triton backward kernel)"""
         logits, ref_logits, input_ids, completion_mask, lse = ctx.saved_tensors
         beta, loss_type, use_ref_model, temperature = ctx.infos
 
         # Create output tensor for gradients
         dlogits = torch.zeros_like(logits)
 
-        # For simplicity, use PyTorch autograd for loss gradient computation
-        # This avoids complex Triton backward kernel implementation
+        # Use PyTorch autograd for gradient computation
         if logits.requires_grad:
             with torch.enable_grad():
                 logits_copy = logits.detach().requires_grad_(True)
