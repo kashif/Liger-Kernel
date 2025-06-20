@@ -13,6 +13,7 @@ class LigerFusedLinearDPOFunction(LigerFusedLinearPreferenceBase):
         ref_chosen_logps=None,
         ref_rejected_logps=None,
         beta=0.1,
+        loss_type="sigmoid",
     ):
         """
         Paper: https://arxiv.org/pdf/2305.18290
@@ -35,6 +36,7 @@ class LigerFusedLinearDPOFunction(LigerFusedLinearPreferenceBase):
             ref_chosen_logps: Reference log probs of chosen tokens (batch_size,)
             ref_rejected_logps: Reference log probs of rejected tokens (batch_size,)
             beta: Weight for the direct preference loss
+            loss_type: Type of loss to compute ("sigmoid", "apo_zero", "apo_down")
         """
 
         if ref_chosen_logps is None:
@@ -48,8 +50,28 @@ class LigerFusedLinearDPOFunction(LigerFusedLinearPreferenceBase):
         chosen_rewards = beta * chosen_logratios
         rejected_rewards = beta * rejected_logratios
 
-        logits_diff = beta * (chosen_logratios - rejected_logratios)
-        loss = -F.logsigmoid(logits_diff).sum() / (full_target.shape[0] // 2)
+        if loss_type == "sigmoid":
+            # Standard DPO loss
+            logits_diff = beta * (chosen_logratios - rejected_logratios)
+            loss = -F.logsigmoid(logits_diff).sum() / (full_target.shape[0] // 2)
+        elif loss_type == "apo_zero":
+            # Eqn (7) of the APO paper (https://huggingface.co/papers/2408.06266)
+            # Use this loss when you believe the chosen outputs are better than your model's default output
+            losses_chosen = 1 - F.sigmoid(beta * chosen_logratios)  # Increase chosen likelihood
+            losses_rejected = F.sigmoid(beta * rejected_logratios)  # Decrease rejected likelihood
+            losses = losses_chosen + losses_rejected
+            loss = losses.sum() / (full_target.shape[0] // 2)
+        elif loss_type == "apo_down":
+            # Eqn (8) of the APO paper (https://huggingface.co/papers/2408.06266)
+            # Use this loss when you believe the chosen outputs are worse than your model's default output.
+            # Decrease chosen likelihood and decrease rejected likelihood more
+            losses_chosen = F.sigmoid(beta * chosen_logratios)
+            losses_rejected = 1 - F.sigmoid(beta * (chosen_logratios - rejected_logratios))
+            losses = losses_chosen + losses_rejected
+            loss = losses.sum() / (full_target.shape[0] // 2)
+        else:
+            raise ValueError(f"Unsupported loss_type: {loss_type}. Supported types are: sigmoid, apo_zero, apo_down")
+
         return loss, chosen_rewards, rejected_rewards
 
     @classmethod
@@ -70,6 +92,7 @@ class LigerFusedLinearDPOFunction(LigerFusedLinearPreferenceBase):
         use_ref_model=True,
         average_log_prob=False,
         chunk_size=1,
+        loss_type="sigmoid",
     ):
         """
         Fused linear layer with DPO loss.
@@ -88,6 +111,7 @@ class LigerFusedLinearDPOFunction(LigerFusedLinearPreferenceBase):
             use_ref_model (bool): Whether to use a reference model
             average_log_prob (bool): Whether to average the log probability per non-masked token
             chunk_size (int): Size of chunks for processing.
+            loss_type (str): Type of loss to compute ("sigmoid", "apo_zero", "apo_down")
         Returns:
             torch.Tensor: Computed loss
         """
@@ -108,12 +132,13 @@ class LigerFusedLinearDPOFunction(LigerFusedLinearPreferenceBase):
             ref_bias=ref_bias,
             average_log_prob=average_log_prob,
             chunk_size=chunk_size,
+            loss_type=loss_type,
         )
 
     @staticmethod
     def backward(ctx, *grad_output):
         grads = LigerFusedLinearPreferenceBase.backward(ctx, grad_output)[:4]
-        return *grads, None, None, None, None, None, None, None, None, None, None
+        return *grads, None, None, None, None, None, None, None, None, None, None, None
 
 
 class LigerFusedLinearDPOLoss(torch.nn.Module):
@@ -130,6 +155,7 @@ class LigerFusedLinearDPOLoss(torch.nn.Module):
         use_ref_model: bool = True,
         average_log_prob: bool = False,
         chunk_size: int = 1,
+        loss_type: str = "sigmoid",
     ):
         """
         Args:
@@ -140,6 +166,7 @@ class LigerFusedLinearDPOLoss(torch.nn.Module):
             use_ref_model (bool): Whether to use a reference model for the DPO loss.
             average_log_prob (bool): Whether to average the log probability per non-masked token.
             chunk_size (int): Size of chunks for processing.
+            loss_type (str): Type of loss to compute. Supported: "sigmoid", "apo_zero", "apo_down".
         """
         super().__init__()
         self.ignore_index = ignore_index
@@ -149,6 +176,12 @@ class LigerFusedLinearDPOLoss(torch.nn.Module):
         self.use_ref_model = use_ref_model
         self.average_log_prob = average_log_prob
         self.chunk_size = chunk_size
+        self.loss_type = loss_type
+
+        # Validate loss_type
+        supported_loss_types = {"sigmoid", "apo_zero", "apo_down"}
+        if self.loss_type not in supported_loss_types:
+            raise ValueError(f"Unsupported loss_type: {self.loss_type}. Supported types are: {supported_loss_types}")
 
     def forward(
         self,
@@ -175,4 +208,5 @@ class LigerFusedLinearDPOLoss(torch.nn.Module):
             self.use_ref_model,
             self.average_log_prob,
             self.chunk_size,
+            self.loss_type,
         )
