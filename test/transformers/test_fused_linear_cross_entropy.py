@@ -6,6 +6,7 @@ import torch
 from test.transformers.test_cross_entropy import CrossEntropyWithZLoss
 from test.utils import assert_verbose_allclose
 from test.utils import set_seed
+from torch.nn import CrossEntropyLoss
 
 from liger_kernel.ops.fused_linear_cross_entropy import LigerFusedLinearCrossEntropyFunction
 from liger_kernel.transformers.functional import CrossEntropyOutput
@@ -412,6 +413,38 @@ def test_correctness_functional(B, T, H, V, scalar, dtype, bias, ce_weight, atol
     y2.backward(grad_output)
 
     assert torch.allclose(x1.grad, x2.grad, atol=atol, rtol=rtol)
+
+
+def test_reduction_none_respects_upstream_masking():
+    """Regression test for per-token gradients when reduction='none'."""
+    B, T, H, V = 2, 4, 10, 15
+    dtype = torch.float32
+
+    base_input = torch.randn(B * T, H, device=device, dtype=dtype)
+    _input_ref = base_input.detach().clone().requires_grad_(True)
+    _input_fused = base_input.detach().clone().requires_grad_(True)
+
+    weight_ref = torch.randn(V, H, device=device, dtype=dtype, requires_grad=True)
+    weight_fused = weight_ref.detach().clone().requires_grad_(True)
+
+    target = torch.randint(0, V, (B * T,), device=device, dtype=torch.long)
+    target[0] = -100
+    mask = (target != -100).to(dtype)
+
+    logits = _input_ref @ weight_ref.t()
+    ce = CrossEntropyLoss(ignore_index=-100, reduction="none")
+    baseline_loss = (ce(logits, target) * mask).sum()
+
+    fused_ce = LigerFusedLinearCrossEntropyLoss(reduction="none")
+    fused_loss = (fused_ce(weight_fused, _input_fused, target) * mask).sum()
+
+    assert_verbose_allclose(baseline_loss, fused_loss, atol=1e-6, rtol=1e-6)
+
+    baseline_loss.backward()
+    fused_loss.backward()
+
+    assert_verbose_allclose(_input_ref.grad, _input_fused.grad, atol=1e-6, rtol=1e-6)
+    assert_verbose_allclose(weight_ref.grad, weight_fused.grad, atol=1e-6, rtol=1e-6)
 
 
 @pytest.mark.parametrize(

@@ -228,7 +228,144 @@ def fused_linear_cross_entropy_forward(
     return loss, z_loss, token_accuracy, grad_input, grad_weight, grad_bias
 
 
+def _recompute_weight_and_bias_grads_for_none_reduction(
+    grad_output,
+    _input,
+    weight,
+    target,
+    ce_weight,
+    bias,
+    ignore_index,
+    lse_square_scale,
+    label_smoothing,
+    softcap,
+    accum_dtype,
+    use_token_scaling,
+):
+    """
+    Recompute weight and bias gradients when reduction='none' so that per-token upstream
+    gradients (grad_output) are applied correctly.
+    """
+    device = _input.device
+    BT, H = _input.shape
+    V = weight.shape[0]
+    BLOCK_SIZE = min(MAX_FUSED_SIZE, triton.next_power_of_2(V))
+
+    inc_factor = triton.cdiv(V, H)
+    chunk_size = triton.next_power_of_2(triton.cdiv(BT, inc_factor))
+    num_chunks = triton.cdiv(BT, chunk_size)
+
+    if accum_dtype is None:
+        grad_weight = torch.zeros_like(weight, device=device) if weight.requires_grad else None
+        grad_bias = torch.zeros_like(bias, device=device) if bias is not None else None
+    else:
+        grad_weight = torch.zeros_like(weight, dtype=accum_dtype, device=device) if weight.requires_grad else None
+        grad_bias = torch.zeros_like(bias, dtype=accum_dtype, device=device) if bias is not None else None
+
+    target_mask = target != ignore_index
+    total_n_non_ignore = target_mask.sum().item()
+    total_sum_non_ignore_ce_weight = total_n_non_ignore
+    ce_weight_sum = 0.0
+    ce_weight_for_kernel = ce_weight
+    if ce_weight is not None:
+        total_sum_non_ignore_ce_weight = (
+            torch.gather(ce_weight, dim=0, index=target.masked_select(target_mask)).sum().item()
+        )
+        ce_weight_sum = ce_weight.sum().item()
+        if ce_weight.stride(-1) != 1:
+            ce_weight_for_kernel = ce_weight.contiguous()
+
+    for chunk_id in range(num_chunks):
+        start_idx = chunk_id * chunk_size
+        end_idx = min((chunk_id + 1) * chunk_size, BT)
+        _input_chunk = _input[start_idx:end_idx]
+
+        logits_chunk = _input_chunk @ weight.t()
+        if bias is not None:
+            logits_chunk = logits_chunk + bias
+
+        target_chunk = target[start_idx:end_idx]
+        grad_output_chunk = grad_output[start_idx:end_idx]
+        n_rows = logits_chunk.shape[0]
+
+        if use_token_scaling:
+            logits_for_softmax = logits_chunk.detach().clone()
+            if softcap is not None:
+                logits_for_softmax = softcap * torch.tanh(logits_for_softmax / softcap)
+
+            probs = torch.softmax(logits_for_softmax, dim=-1)
+
+            valid_target_mask = target_chunk != ignore_index
+            valid_targets = target_chunk[valid_target_mask]
+
+            if len(valid_targets) > 0:
+                valid_probs = probs[valid_target_mask]
+                pred_probs_valid = torch.gather(valid_probs, -1, valid_targets.unsqueeze(-1)).squeeze(-1)
+
+                scaling_factors = torch.zeros_like(target_chunk, dtype=probs.dtype, device=probs.device)
+                scaling_factors[valid_target_mask] = pred_probs_valid
+            else:
+                scaling_factors = torch.zeros_like(target_chunk, dtype=probs.dtype, device=probs.device)
+
+        logits_chunk = logits_chunk.contiguous()
+        target_chunk = target_chunk.contiguous()
+
+        loss_slice = torch.empty_like(target_chunk, dtype=torch.float32, device=device)
+        liger_cross_entropy_kernel[(n_rows,)](
+            X_ptr=logits_chunk,
+            X_stride=logits_chunk.stride(-2),
+            Y_ptr=target_chunk,
+            Y_stride=target_chunk.stride(-1),
+            weight_ptr=ce_weight_for_kernel,
+            loss_ptr=loss_slice,
+            z_loss_ptr=None,
+            loss_stride=loss_slice.stride(-1),
+            token_accuracy_ptr=None,
+            token_accuracy_stride=0,
+            n_cols=V,
+            n_non_ignore=total_n_non_ignore,
+            sum_non_ignore_weight=total_sum_non_ignore_ce_weight,
+            weight_sum=ce_weight_sum,
+            ignore_index=ignore_index,
+            lse_square_scale=lse_square_scale,
+            label_smoothing=label_smoothing,
+            reduction="none",
+            softcap=softcap,
+            RETURN_Z_LOSS=False,
+            RETURN_TOKEN_ACCURACY=False,
+            BLOCK_SIZE=BLOCK_SIZE,
+            HAS_WEIGHT=True if ce_weight is not None else False,
+            HAS_SOFTCAPPING=True if softcap is not None else False,
+            HAS_GRADIENTS=True,
+            num_warps=32 if not is_hip() else 16,
+        )
+
+        grad_logits_chunk = logits_chunk
+
+        if use_token_scaling:
+            grad_logits_chunk = grad_logits_chunk * scaling_factors.unsqueeze(-1)
+
+        grad_logits_chunk = grad_logits_chunk * grad_output_chunk.reshape(-1, 1)
+
+        if grad_weight is not None:
+            grad_weight += torch.mm(grad_logits_chunk.t(), _input_chunk).float()
+
+        if grad_bias is not None:
+            grad_bias += grad_logits_chunk.sum(dim=0)
+
+    grad_weight = grad_weight.to(weight.dtype) if grad_weight is not None else None
+    grad_bias = grad_bias.to(bias.dtype) if grad_bias is not None else None
+
+    return grad_weight, grad_bias
+
+
 def fused_linear_cross_entropy_backward(grad_output, grad_input, grad_weight, grad_bias):
+    if grad_output.ndim > 0:
+        if grad_weight is not None or grad_bias is not None:
+            raise RuntimeError("Per-token grad_output requires recomputing weight/bias gradients")
+        grad_input = grad_input * grad_output.reshape(-1, 1).to(grad_input.dtype)
+        return grad_input, grad_weight, grad_bias
+
     # If cross entropy is the last layer, grad_output is 1.0. Skip the mul to save time
     if not torch.equal(grad_output, torch.tensor(1.0, device=grad_output.device)):
         # We use a Triton kernel instead of a PyTorch operation because modifying inputs in-place
@@ -336,12 +473,41 @@ class LigerFusedLinearCrossEntropyFunction(torch.autograd.Function):
             use_token_scaling=use_token_scaling,
             return_token_accuracy=return_token_accuracy,
         )
-        # downcast to dtype and store for backward
-        ctx.save_for_backward(
-            grad_input.detach(),
-            grad_weight.detach() if grad_weight is not None else None,
-            grad_bias.detach() if bias is not None else None,
-        )
+        has_grad_weight = grad_weight is not None
+        has_grad_bias = grad_bias is not None
+        needs_recompute = reduction == "none" and (has_grad_weight or has_grad_bias)
+
+        tensors_to_save = [grad_input.detach()]
+        if needs_recompute:
+            tensors_to_save.extend(
+                [
+                    _input.detach(),
+                    weight,
+                    target,
+                ]
+            )
+            if ce_weight is not None:
+                tensors_to_save.append(ce_weight)
+            if bias is not None:
+                tensors_to_save.append(bias)
+        else:
+            if has_grad_weight:
+                tensors_to_save.append(grad_weight.detach())
+            if has_grad_bias:
+                tensors_to_save.append(grad_bias.detach())
+
+        ctx.save_for_backward(*tensors_to_save)
+        ctx.has_grad_weight = has_grad_weight
+        ctx.has_grad_bias = has_grad_bias
+        ctx.has_ce_weight = ce_weight is not None
+        ctx.needs_recompute = needs_recompute
+        ctx.ignore_index = ignore_index
+        ctx.lse_square_scale = lse_square_scale
+        ctx.label_smoothing = label_smoothing
+        ctx.reduction = reduction
+        ctx.softcap = softcap
+        ctx.accum_dtype = accum_dtype
+        ctx.use_token_scaling = use_token_scaling
         ctx.return_z_loss = return_z_loss
         ctx.return_token_accuracy = return_token_accuracy
         return loss, z_loss, token_accuracy
@@ -353,10 +519,76 @@ class LigerFusedLinearCrossEntropyFunction(torch.autograd.Function):
             del grad_output2  # z_loss is only for logging
         if ctx.return_token_accuracy:
             del grad_output3  # token_accuracy is only for metrics
-        (grad_input, grad_weight, grad_bias) = ctx.saved_tensors
-        grad_input, grad_weight, grad_bias = fused_linear_cross_entropy_backward(
-            grad_output, grad_input, grad_weight, grad_bias
-        )
+
+        saved_tensors = ctx.saved_tensors
+        idx = 0
+        grad_input = saved_tensors[idx]
+        idx += 1
+
+        grad_weight = None
+        grad_bias = None
+        _input = None
+        weight = None
+        target = None
+        ce_weight = None
+        bias = None
+
+        if ctx.needs_recompute:
+            _input = saved_tensors[idx]
+            idx += 1
+            weight = saved_tensors[idx]
+            idx += 1
+            target = saved_tensors[idx]
+            idx += 1
+            if ctx.has_ce_weight:
+                ce_weight = saved_tensors[idx]
+                idx += 1
+            if ctx.has_grad_bias:
+                bias = saved_tensors[idx]
+                idx += 1
+        else:
+            if ctx.has_grad_weight:
+                grad_weight = saved_tensors[idx]
+                idx += 1
+            if ctx.has_grad_bias:
+                grad_bias = saved_tensors[idx]
+                idx += 1
+
+        if ctx.needs_recompute:
+            if grad_output.ndim == 0:
+                grad_output_main = grad_output.expand(target.shape[0])
+            else:
+                grad_output_main = grad_output.reshape(-1)
+
+            if grad_output_main.numel() != target.numel():
+                raise RuntimeError(
+                    f"Expected grad_output to have {target.numel()} elements for reduction='none', "
+                    f"but got {grad_output_main.numel()}."
+                )
+
+            grad_output_main = grad_output_main.to(device=grad_input.device)
+
+            grad_input = grad_input * grad_output_main.reshape(-1, 1)
+
+            grad_weight, grad_bias = _recompute_weight_and_bias_grads_for_none_reduction(
+                grad_output=grad_output_main,
+                _input=_input,
+                weight=weight,
+                target=target,
+                ce_weight=ce_weight,
+                bias=bias,
+                ignore_index=ctx.ignore_index,
+                lse_square_scale=ctx.lse_square_scale,
+                label_smoothing=ctx.label_smoothing,
+                softcap=ctx.softcap,
+                accum_dtype=ctx.accum_dtype,
+                use_token_scaling=ctx.use_token_scaling,
+            )
+        else:
+            grad_input, grad_weight, grad_bias = fused_linear_cross_entropy_backward(
+                grad_output, grad_input, grad_weight, grad_bias
+            )
+
         return (
             grad_input,
             grad_weight,
