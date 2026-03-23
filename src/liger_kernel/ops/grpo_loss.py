@@ -3,6 +3,8 @@ import triton
 import triton.language as tl
 
 from liger_kernel.chunked_loss.fused_linear_ppo import LigerFusedLinearPPOBase
+from liger_kernel.chunked_loss.fused_linear_ppo import _selective_logprob_backward
+from liger_kernel.chunked_loss.fused_linear_ppo import _selective_logprob_forward
 
 # Loss type constants for Triton constexpr branching
 # GRPO/DAPO/BNPO/DR_GRPO all use the same per-token loss computation (standard PPO clipping)
@@ -621,6 +623,131 @@ def _compute_per_token_components(
     return per_token_loss, per_token_kl, is_clipped
 
 
+class _FusedLinearReducedGRPOFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        hidden_states,
+        lm_head_weight,
+        old_logp,
+        ref_logp,
+        completion_ids,
+        advantages,
+        completion_mask,
+        lm_head_bias,
+        temperature,
+        beta,
+        eps_low,
+        eps_high,
+        loss_type,
+        max_completion_length,
+        importance_sampling_level,
+        sapo_temperature_pos,
+        sapo_temperature_neg,
+        vllm_is_ratio,
+        delta,
+        use_bias_correction_kl,
+    ):
+        B, L_ADD_1, H = hidden_states.shape
+        L = L_ADD_1 - 1
+        hidden = hidden_states[:, :-1, :].contiguous().view(B * L, H)
+        targets = completion_ids.contiguous().view(B * L)
+
+        per_token_logps, log_z = _selective_logprob_forward(hidden, lm_head_weight, targets, lm_head_bias, temperature)
+        per_token_logps = per_token_logps.view(B, L)
+
+        with torch.enable_grad():
+            logps_for_grad = per_token_logps.detach().requires_grad_(True)
+            ref_per_token_logps = ref_logp if ref_logp is not None else logps_for_grad.detach()
+            per_token_loss, per_token_kl, is_clipped = _compute_per_token_components(
+                logps_for_grad,
+                completion_mask.float(),
+                advantages.to(torch.float32),
+                old_logp,
+                ref_per_token_logps,
+                eps_low,
+                eps_high,
+                beta,
+                importance_sampling_level,
+                loss_type,
+                sapo_temperature_pos,
+                sapo_temperature_neg,
+                vllm_is_ratio=vllm_is_ratio,
+                delta=delta,
+                use_bias_correction_kl=use_bias_correction_kl,
+            )
+            reduced_loss = _reduce_loss(per_token_loss, completion_mask.float(), loss_type, max_completion_length, B, L)
+            dloss_dlogp = torch.autograd.grad(reduced_loss, logps_for_grad)[0]
+
+        mask_sum = completion_mask.float().sum().clamp(min=1.0)
+        kl_mean = (
+            (per_token_kl * completion_mask.float()).sum() / mask_sum
+            if per_token_kl is not None
+            else hidden_states.new_zeros(())
+        )
+        clip_ratio = (is_clipped.float() * completion_mask.float()).sum() / mask_sum
+
+        if lm_head_bias is None:
+            lm_head_bias = hidden.new_empty((0,))
+        if old_logp is None:
+            old_logp = hidden.new_empty((0,))
+        if ref_logp is None:
+            ref_logp = hidden.new_empty((0,))
+        if vllm_is_ratio is None:
+            vllm_is_ratio = hidden.new_empty((0,))
+
+        ctx.save_for_backward(hidden, lm_head_weight, targets, lm_head_bias, log_z, dloss_dlogp.reshape(-1))
+        ctx.has_bias = lm_head_bias.numel() > 0
+        ctx.temperature = temperature
+        ctx.B = B
+        ctx.L = L
+        ctx.H = H
+
+        return reduced_loss.detach(), kl_mean.detach(), clip_ratio.detach()
+
+    @staticmethod
+    def backward(ctx, grad_loss, grad_kl_mean, grad_clip_ratio):
+        del grad_kl_mean, grad_clip_ratio
+        hidden, lm_head_weight, targets, lm_head_bias, log_z, dloss_dlogp = ctx.saved_tensors
+
+        grad_hidden, grad_weight, grad_bias = _selective_logprob_backward(
+            hidden=hidden,
+            weight=lm_head_weight,
+            targets=targets,
+            bias=lm_head_bias if ctx.has_bias else None,
+            log_z=log_z,
+            grad_logprobs=dloss_dlogp * grad_loss.to(torch.float32),
+            temperature=ctx.temperature,
+            vocab_chunk_size=2048,
+        )
+
+        grad_hidden_full = torch.zeros((ctx.B, ctx.L + 1, ctx.H), device=hidden.device, dtype=grad_hidden.dtype)
+        grad_hidden_full[:, :-1, :] = grad_hidden.view(ctx.B, ctx.L, ctx.H)
+
+        return (
+            grad_hidden_full.to(hidden.dtype),
+            grad_weight.to(lm_head_weight.dtype),
+            None,
+            None,
+            None,
+            None,
+            None,
+            grad_bias.to(lm_head_bias.dtype) if ctx.has_bias else None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+
+
 def fused_linear_grpo_loss(
     hidden_states,
     lm_head_weight,
@@ -686,6 +813,31 @@ def fused_linear_grpo_loss(
             f"vllm_is_ratio shape must be ({B}, 1) or ({B}, {L}), got {tuple(vllm_is_ratio.shape)}"
         )
 
+    mask = completion_mask.float()
+    if reduce:
+        return _FusedLinearReducedGRPOFunction.apply(
+            hidden_states,
+            lm_head_weight,
+            old_logp,
+            ref_logp,
+            completion_ids,
+            advantages,
+            mask,
+            lm_head_bias,
+            temperature,
+            beta,
+            eps_low,
+            eps_high,
+            loss_type,
+            max_completion_length,
+            importance_sampling_level,
+            sapo_temperature_pos,
+            sapo_temperature_neg,
+            vllm_is_ratio,
+            delta,
+            use_bias_correction_kl,
+        )
+
     per_token_logps = LigerFusedLinearPPOBase.chunk_forward(
         hidden_states[:, :-1, :].contiguous(),
         lm_head_weight,
@@ -697,7 +849,7 @@ def fused_linear_grpo_loss(
 
     per_token_loss, per_token_kl, is_clipped = _compute_per_token_components(
         per_token_logps,
-        completion_mask.float(),
+        mask,
         advantages.to(torch.float32),
         old_logp,
         ref_per_token_logps,
@@ -713,7 +865,6 @@ def fused_linear_grpo_loss(
         use_bias_correction_kl=use_bias_correction_kl,
     )
 
-    mask = completion_mask.float()
     if not reduce:
         return per_token_loss * mask, per_token_kl * mask if per_token_kl is not None else None, is_clipped * mask
 

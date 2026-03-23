@@ -196,56 +196,68 @@ class _ChunkedSelectiveLogProbFunction(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_logprobs):
         hidden, weight, targets, bias, log_z = ctx.saved_tensors
-        temperature = ctx.temperature
-        vocab_chunk_size = ctx.vocab_chunk_size
-        has_bias = ctx.has_bias
-        inv_t = 1.0 / temperature
-
-        n_rows, _ = hidden.shape
-        vocab_size = weight.shape[0]
-        grad_hidden = torch.zeros(hidden.shape, device=hidden.device, dtype=torch.float32)
-        grad_weight = torch.zeros(weight.shape, device=weight.device, dtype=torch.float32)
-        grad_bias = torch.zeros((vocab_size,), device=weight.device, dtype=torch.float32) if has_bias else None
-
-        mm_buf = torch.empty((n_rows, vocab_chunk_size), device=hidden.device, dtype=hidden.dtype)
-        logits_buf = torch.empty((n_rows, vocab_chunk_size), device=hidden.device, dtype=torch.float32)
-
-        grad_logprobs = grad_logprobs.to(torch.float32)
-        row_idx = torch.arange(n_rows, device=hidden.device)
-
-        for start in range(0, vocab_size, vocab_chunk_size):
-            end = min(start + vocab_chunk_size, vocab_size)
-            chunk_width = end - start
-            weight_chunk = weight[start:end]
-
-            torch.mm(hidden, weight_chunk.t(), out=mm_buf[:, :chunk_width])
-            logits_chunk = logits_buf[:, :chunk_width]
-            logits_chunk.copy_(mm_buf[:, :chunk_width])
-            if has_bias:
-                logits_chunk.add_(bias[start:end].to(torch.float32))
-            logits_chunk.mul_(inv_t)
-
-            probs = torch.exp(logits_chunk - log_z.unsqueeze(-1))
-            grad_logits = (-grad_logprobs).unsqueeze(-1) * probs
-
-            in_chunk = (targets >= start) & (targets < end)
-            local_idx = torch.clamp(targets - start, 0, end - start - 1)
-            grad_logits[row_idx, local_idx] += grad_logprobs * in_chunk
-            grad_logits.mul_(inv_t)
-
-            grad_hidden.add_(grad_logits @ weight_chunk.float())
-            grad_weight[start:end].add_(grad_logits.t() @ hidden.float())
-            if has_bias:
-                grad_bias[start:end].add_(grad_logits.sum(dim=0))
-
+        grad_hidden, grad_weight, grad_bias = _selective_logprob_backward(
+            hidden=hidden,
+            weight=weight,
+            targets=targets,
+            bias=bias if ctx.has_bias else None,
+            log_z=log_z,
+            grad_logprobs=grad_logprobs,
+            temperature=ctx.temperature,
+            vocab_chunk_size=ctx.vocab_chunk_size,
+        )
         return (
             grad_hidden.to(hidden.dtype),
             grad_weight.to(weight.dtype),
             None,
-            grad_bias.to(bias.dtype) if has_bias else None,
+            grad_bias.to(bias.dtype) if ctx.has_bias else None,
             None,
             None,
         )
+
+
+def _selective_logprob_backward(hidden, weight, targets, bias, log_z, grad_logprobs, temperature, vocab_chunk_size):
+    inv_t = 1.0 / temperature
+    n_rows, _ = hidden.shape
+    vocab_size = weight.shape[0]
+    has_bias = bias is not None
+
+    grad_hidden = torch.zeros(hidden.shape, device=hidden.device, dtype=torch.float32)
+    grad_weight = torch.zeros(weight.shape, device=weight.device, dtype=torch.float32)
+    grad_bias = torch.zeros((vocab_size,), device=weight.device, dtype=torch.float32) if has_bias else None
+
+    mm_buf = torch.empty((n_rows, vocab_chunk_size), device=hidden.device, dtype=hidden.dtype)
+    logits_buf = torch.empty((n_rows, vocab_chunk_size), device=hidden.device, dtype=torch.float32)
+
+    grad_logprobs = grad_logprobs.to(torch.float32)
+    row_idx = torch.arange(n_rows, device=hidden.device)
+
+    for start in range(0, vocab_size, vocab_chunk_size):
+        end = min(start + vocab_chunk_size, vocab_size)
+        chunk_width = end - start
+        weight_chunk = weight[start:end]
+
+        torch.mm(hidden, weight_chunk.t(), out=mm_buf[:, :chunk_width])
+        logits_chunk = logits_buf[:, :chunk_width]
+        logits_chunk.copy_(mm_buf[:, :chunk_width])
+        if has_bias:
+            logits_chunk.add_(bias[start:end].to(torch.float32))
+        logits_chunk.mul_(inv_t)
+
+        probs = torch.exp(logits_chunk - log_z.unsqueeze(-1))
+        grad_logits = (-grad_logprobs).unsqueeze(-1) * probs
+
+        in_chunk = (targets >= start) & (targets < end)
+        local_idx = torch.clamp(targets - start, 0, end - start - 1)
+        grad_logits[row_idx, local_idx] += grad_logprobs * in_chunk
+        grad_logits.mul_(inv_t)
+
+        grad_hidden.add_(grad_logits @ weight_chunk.float())
+        grad_weight[start:end].add_(grad_logits.t() @ hidden.float())
+        if has_bias:
+            grad_bias[start:end].add_(grad_logits.sum(dim=0))
+
+    return grad_hidden, grad_weight, grad_bias
 
 
 class LigerFusedLinearPPOBase(torch.autograd.Function):
