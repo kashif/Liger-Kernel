@@ -2,6 +2,8 @@ import torch
 import triton
 import triton.language as tl
 
+from liger_kernel.chunked_loss.fused_linear_ppo import LigerFusedLinearPPOBase
+
 # Loss type constants for Triton constexpr branching
 # GRPO/DAPO/BNPO/DR_GRPO all use the same per-token loss computation (standard PPO clipping)
 _LOSS_TYPE_GRPO: tl.constexpr = tl.constexpr(0)
@@ -545,6 +547,181 @@ def _reduce_loss(per_token_loss, mask, loss_type, max_completion_length, B, L):
     elif loss_type == "luspo":
         return (per_token_loss * mask.sum(-1, keepdim=True)).mean()
     raise ValueError(f"Unknown loss_type: {loss_type}. Expected one of: grpo, bnpo, dr_grpo, dapo, cispo, sapo, luspo")
+
+
+def _compute_per_token_components(
+    per_token_logps,
+    attention_mask,
+    advantages,
+    old_per_token_logps,
+    ref_per_token_logps,
+    epsilon_low,
+    epsilon_high,
+    beta,
+    importance_sampling_level,
+    loss_type,
+    sapo_temperature_pos,
+    sapo_temperature_neg,
+    vllm_is_ratio=None,
+    delta=None,
+    use_bias_correction_kl=False,
+):
+    attention_mask = attention_mask.to(per_token_logps.dtype)
+    old_per_token_logps = old_per_token_logps if old_per_token_logps is not None else per_token_logps.detach()
+    log_ratio = per_token_logps - old_per_token_logps
+
+    if importance_sampling_level == "token":
+        log_importance_weights = log_ratio
+    else:
+        log_importance_weights = (log_ratio * attention_mask).sum(-1) / attention_mask.sum(-1).clamp(min=1.0)
+        log_importance_weights = log_importance_weights.unsqueeze(-1)
+
+    coef_1 = torch.exp(log_importance_weights)
+    expanded_advantages = advantages.unsqueeze(1)
+
+    if loss_type == "sapo":
+        temperature = torch.where(expanded_advantages > 0, sapo_temperature_pos, sapo_temperature_neg)
+        sigmoid_input = temperature * (coef_1 - 1.0)
+        sapo_coef = torch.sigmoid(sigmoid_input) * 4.0 / temperature
+        per_token_loss = -sapo_coef * expanded_advantages
+        is_lower_clipped = torch.zeros_like(coef_1, dtype=torch.bool)
+        is_upper_clipped = torch.zeros_like(coef_1, dtype=torch.bool)
+    elif loss_type == "cispo":
+        coef_2 = torch.clamp(coef_1, max=epsilon_high).detach()
+        per_token_loss = -coef_2 * expanded_advantages * per_token_logps
+        is_lower_clipped = torch.zeros_like(coef_1, dtype=torch.bool)
+        is_upper_clipped = coef_1 > epsilon_high
+    else:
+        coef_2 = torch.clamp(coef_1, 1 - epsilon_low, 1 + epsilon_high)
+        is_lower_clipped = coef_1 < 1 - epsilon_low
+        is_upper_clipped = coef_1 > 1 + epsilon_high
+        if delta is not None:
+            coef_1 = torch.clamp(coef_1, max=delta)
+        per_token_loss1 = coef_1 * expanded_advantages
+        per_token_loss2 = coef_2 * expanded_advantages
+        per_token_loss = -torch.min(per_token_loss1, per_token_loss2)
+
+    if vllm_is_ratio is not None:
+        per_token_loss = per_token_loss * vllm_is_ratio
+
+    per_token_kl = None
+    if beta != 0.0:
+        per_token_kl = torch.exp(ref_per_token_logps - per_token_logps) - (ref_per_token_logps - per_token_logps) - 1
+        if use_bias_correction_kl:
+            token_coef_1 = torch.exp(per_token_logps - old_per_token_logps)
+            per_token_kl = per_token_kl * token_coef_1
+        per_token_loss = per_token_loss + beta * per_token_kl
+
+    if importance_sampling_level == "token":
+        is_clipped = (is_lower_clipped & (expanded_advantages < 0)) | (is_upper_clipped & (expanded_advantages > 0))
+    else:
+        is_clipped = (is_lower_clipped & (expanded_advantages < 0)) | (is_upper_clipped & (expanded_advantages > 0))
+        is_clipped = is_clipped.expand_as(attention_mask)
+
+    return per_token_loss, per_token_kl, is_clipped
+
+
+def fused_linear_grpo_loss(
+    hidden_states,
+    lm_head_weight,
+    old_logp,
+    ref_logp,
+    completion_ids,
+    advantages,
+    completion_mask=None,
+    lm_head_bias=None,
+    temperature=0.9,
+    beta=0.04,
+    eps_low=0.2,
+    eps_high=0.4,
+    loss_type="dapo",
+    max_completion_length=None,
+    importance_sampling_level="token",
+    reduce=False,
+    sapo_temperature_pos=1.0,
+    sapo_temperature_neg=1.05,
+    vllm_is_ratio=None,
+    delta=None,
+    use_bias_correction_kl=False,
+):
+    assert (
+        hidden_states is not None
+        and lm_head_weight is not None
+        and completion_ids is not None
+        and advantages is not None
+    ), "must provide hidden_states, lm_head_weight, completion_ids and advantages"
+    assert importance_sampling_level in ("token", "sequence"), (
+        f"importance_sampling_level must be 'token' or 'sequence', got {importance_sampling_level}"
+    )
+    if loss_type not in _str_to_loss_type:
+        raise ValueError(f"Unknown loss_type '{loss_type}'. Supported types: {list(_str_to_loss_type.keys())}")
+    if delta is not None and loss_type in ("cispo", "sapo"):
+        raise ValueError(f"delta (two-sided clipping) is not supported for loss_type='{loss_type}'.")
+    if importance_sampling_level == "sequence" and loss_type in ("cispo", "sapo"):
+        raise ValueError(
+            f"Sequence-level importance sampling is not supported for loss_type='{loss_type}'. "
+            f"Use importance_sampling_level='token' instead."
+        )
+    if loss_type == "sapo":
+        if sapo_temperature_pos <= 0:
+            raise ValueError(f"sapo_temperature_pos must be positive, got {sapo_temperature_pos}")
+        if sapo_temperature_neg <= 0:
+            raise ValueError(f"sapo_temperature_neg must be positive, got {sapo_temperature_neg}")
+
+    B, L_ADD_1, _ = hidden_states.shape
+    L = L_ADD_1 - 1
+    assert completion_ids.shape == (B, L), f"completion_ids shape must be ({B}, {L}), got {tuple(completion_ids.shape)}"
+    if completion_mask is None:
+        completion_mask = torch.ones(B, L, device=hidden_states.device, dtype=torch.float32)
+    else:
+        completion_mask = completion_mask.to(device=hidden_states.device)
+
+    if vllm_is_ratio is not None:
+        assert vllm_is_ratio.dim() in (1, 2), (
+            f"vllm_is_ratio must be 1D (B,) or 2D (B, L) / (B, 1), got {vllm_is_ratio.dim()}D"
+        )
+        if vllm_is_ratio.dim() == 1:
+            vllm_is_ratio = vllm_is_ratio.unsqueeze(-1)
+        assert vllm_is_ratio.shape[0] == B and vllm_is_ratio.shape[1] in (1, L), (
+            f"vllm_is_ratio shape must be ({B}, 1) or ({B}, {L}), got {tuple(vllm_is_ratio.shape)}"
+        )
+
+    per_token_logps = LigerFusedLinearPPOBase.chunk_forward(
+        hidden_states[:, :-1, :].contiguous(),
+        lm_head_weight,
+        completion_ids.contiguous(),
+        bias=lm_head_bias,
+        temperature=temperature,
+    )
+    ref_per_token_logps = ref_logp if ref_logp is not None else per_token_logps.detach()
+
+    per_token_loss, per_token_kl, is_clipped = _compute_per_token_components(
+        per_token_logps,
+        completion_mask.float(),
+        advantages.to(torch.float32),
+        old_logp,
+        ref_per_token_logps,
+        eps_low,
+        eps_high,
+        beta,
+        importance_sampling_level,
+        loss_type,
+        sapo_temperature_pos,
+        sapo_temperature_neg,
+        vllm_is_ratio=vllm_is_ratio,
+        delta=delta,
+        use_bias_correction_kl=use_bias_correction_kl,
+    )
+
+    mask = completion_mask.float()
+    if not reduce:
+        return per_token_loss * mask, per_token_kl * mask if per_token_kl is not None else None, is_clipped * mask
+
+    reduced_loss = _reduce_loss(per_token_loss, mask, loss_type, max_completion_length, B, L)
+    mask_sum = mask.sum().clamp(min=1.0)
+    kl_mean = (per_token_kl * mask).sum() / mask_sum if per_token_kl is not None else None
+    clip_ratio = (is_clipped.float() * mask).sum() / mask_sum
+    return reduced_loss, kl_mean, clip_ratio
 
 
 class GrpoLossFunction(torch.autograd.Function):
