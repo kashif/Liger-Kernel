@@ -93,6 +93,8 @@ if TYPE_CHECKING:
     from liger_kernel.transformers.monkey_patch import apply_liger_kernel_to_qwen3_vl_moe  # noqa: F401
     from liger_kernel.transformers.monkey_patch import apply_liger_kernel_to_smollm3  # noqa: F401
     from liger_kernel.transformers.monkey_patch import apply_liger_kernel_to_smolvlm  # noqa: F401
+    from liger_kernel.transformers.tree_attention import liger_tree_attention_forward  # noqa: F401
+    from liger_kernel.transformers.tree_attention import register_liger_tree_attention  # noqa: F401
 
 
 # Check if 'transformers' is installed
@@ -181,6 +183,10 @@ def __getattr__(name: str):
         module = importlib.import_module("liger_kernel.transformers.monkey_patch")
         return getattr(module, name)
 
+    if name in {"liger_tree_attention_forward", "register_liger_tree_attention"}:
+        module = importlib.import_module("liger_kernel.transformers.tree_attention")
+        return getattr(module, name)
+
     raise AttributeError(f"module {__name__} has no attribute {name}")
 
 
@@ -231,6 +237,8 @@ if _TRANSFORMERS_AVAILABLE:
     __all__.extend(
         [
             "AutoLigerKernelForCausalLM",
+            "liger_tree_attention_forward",
+            "register_liger_tree_attention",
             "_apply_liger_kernel",
             "_apply_liger_kernel_to_instance",
             "apply_liger_kernel_to_falcon_h1",

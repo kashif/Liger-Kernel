@@ -30,6 +30,7 @@ from liger_kernel.ops import LigerRopeFunction
 from liger_kernel.ops import LigerSiLUMulFunction
 from liger_kernel.ops import LigerSoftmaxFunction
 from liger_kernel.ops import LigerSparsemaxFunction
+from liger_kernel.ops import LigerTreeAttentionFunction
 from liger_kernel.ops import LigerTVDLossFunction
 from liger_kernel.ops import fused_linear_score_centering
 
@@ -362,6 +363,33 @@ def liger_fused_neighborhood_attention(
         Output tensor of shape [batch_size, num_heads, seq_len, head_dim]
     """
     return LigerFusedNeighborhoodAttentionFunction.apply(query, key, value, kernel_size, dilation, scale)
+
+
+def liger_tree_attention(
+    query,
+    key,
+    value,
+    metadata,
+    scale: float = None,
+    sliding_window: int = None,
+    output_dtype: torch.dtype = None,
+):
+    """
+    Liger tree attention over a prefix-tree-packed row, without gathering per-segment K/V.
+
+    Args:
+        query: Query tensor of shape [num_tokens, num_heads, head_dim]
+        key: Key tensor of shape [num_tokens, num_kv_heads, head_dim]
+        value: Value tensor of shape [num_tokens, num_kv_heads, head_dim]
+        metadata: `TreeAttentionMetadata` of the row, from `liger_kernel.ops.tree_attention.build_tree_attention_metadata`
+        scale: Scaling factor for attention scores (default: rsqrt(head_dim))
+        sliding_window: Window in tree positions (default: None, no window)
+        output_dtype: `query.dtype` or `torch.float32` (default: None, `query.dtype`)
+
+    Returns:
+        Output tensor of shape [num_tokens, num_heads, head_dim]
+    """
+    return LigerTreeAttentionFunction.apply(query, key, value, metadata, scale, sliding_window, output_dtype)
 
 
 def liger_tvd(

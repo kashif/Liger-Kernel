@@ -108,6 +108,7 @@ from liger_kernel.ops.swiglu import swiglu_backward  # noqa: F401
 from liger_kernel.ops.swiglu import swiglu_forward  # noqa: F401
 from liger_kernel.ops.tiled_mlp import LigerTiledMLPFunction  # noqa: F401
 from liger_kernel.ops.tiled_mlp import apply_tiled_mlp  # noqa: F401
+from liger_kernel.ops.tree_attention import LigerTreeAttentionFunction  # noqa: F401
 from liger_kernel.ops.tvd import LigerTVDLossFunction  # noqa: F401
 from liger_kernel.ops.vocab_parallel_cross_entropy import LigerVocabParallelCEFunction  # noqa: F401
 
