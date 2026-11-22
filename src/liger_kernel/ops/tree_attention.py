@@ -49,6 +49,17 @@ descriptors, which Triton lowers to TMA loads; elsewhere (and on ROCm, Triton bu
 tensors a descriptor cannot address) the kernels read them through masked pointer loads. Tile sizes, warps and pipeline stages
 are chosen by ``triton.autotune`` (``LIGER_TREE_ATTENTION_AUTOTUNE=0`` pins one portable config). The streamed loops run
 inside the walk over a segment's ancestors, with data-dependent bounds, so they are not warp-specialized.
+
+Sequence parallelism: a row split evenly over a process group, every rank holding its contiguous shard of tokens (as
+transformers / accelerate shard ``input_ids``), with the group passed to [`build_tree_attention_metadata`]:
+
+- ``cp_group`` (context parallel, Llama 3 style): each rank all-gathers K/V (small under GQA) and runs only its own
+  query tiles against the whole row; the kernels take the rank's query range, so the tree metadata stays global. In
+  backward each rank re-gathers K/V, computes the dK/dV of its queries for the whole row in fp32, and the group
+  reduce-scatters them. Unlike ring attention, no partial outputs are merged, so the numerics are those of one GPU.
+- ``sp_group`` (Ulysses / DeepSpeed ALST style): an all-to-all trades the token shard for a head shard, each rank runs
+  the whole row for ``H / P`` heads (key/value heads replicated when there are fewer than ``P``), and a second all-to-all
+  trades back.
 """
 
 import functools
@@ -85,6 +96,11 @@ class TreeAttentionMetadata(NamedTuple):
     subtree_end: torch.Tensor  # (S,) int32, end token (exclusive) of the pre-order range of s and its descendants
     positions: torch.Tensor  # (N,) int32, depth of each token in the tree (its position in its samples)
     tiles: tuple  # per size in BLOCK_T_SIZES: (T, 2) int32, (segment, first token) of each tile, segment -1 for padding
+    # context / sequence parallelism (see the module docstring); the fields above always describe the whole row
+    query_start: int = 0  # first token of this rank's query shard
+    query_tiles: Optional[tuple] = None  # `tiles` of this rank's query shard (None: `tiles`)
+    cp_group: Optional["torch.distributed.ProcessGroup"] = None
+    sp_group: Optional["torch.distributed.ProcessGroup"] = None
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -127,18 +143,22 @@ def _tree_segment_info_kernel(
     tl.store(POS_START + s, pos)
 
 
-def _segment_tiles(cu_seqlens: torch.Tensor, n_tokens: int, block: int) -> torch.Tensor:
-    """(segment, first token) of every `block`-token tile of every segment, padded with segment -1 to a static count."""
+def _segment_tiles(cu_seqlens: torch.Tensor, block: int, lo: int, hi: int) -> torch.Tensor:
+    """
+    (segment, first token) of every `block`-token tile of every segment's part in tokens `[lo, hi)`, padded with
+    segment -1 to a static count.
+    """
     n_segments = cu_seqlens.numel() - 1
-    lengths = (cu_seqlens[1:] - cu_seqlens[:-1]).long()
+    starts = cu_seqlens[:-1].long().clamp(lo, hi)
+    lengths = cu_seqlens[1:].long().clamp(lo, hi) - starts
     chunks = (lengths + block - 1) // block
     ends = chunks.cumsum(0)
-    n_tiles = triton.cdiv(n_tokens, block) + n_segments  # upper bound on sum(ceil(len / block)), no sync
+    n_tiles = triton.cdiv(hi - lo, block) + n_segments  # upper bound on sum(ceil(len / block)), no sync
     tile = torch.arange(n_tiles, device=cu_seqlens.device)
     segment = torch.searchsorted(ends, tile, right=True)
     valid = segment < n_segments
     segment = segment.clamp(max=n_segments - 1)
-    start = cu_seqlens[segment].long() + (tile - (ends[segment] - chunks[segment])) * block
+    start = starts[segment] + (tile - (ends[segment] - chunks[segment])) * block
     return torch.stack([torch.where(valid, segment, -1), torch.where(valid, start, 0)], dim=1).to(torch.int32)
 
 
@@ -146,16 +166,24 @@ def build_tree_attention_metadata(
     cu_seqlens: torch.Tensor,
     parents: torch.Tensor,
     n_tokens: Optional[int] = None,
+    *,
+    cp_group: Optional["torch.distributed.ProcessGroup"] = None,
+    sp_group: Optional["torch.distributed.ProcessGroup"] = None,
 ) -> TreeAttentionMetadata:
     """
-    Launch metadata for [`tree_attention`], to build once per row and share across layers.
+    Launch metadata for [`LigerTreeAttentionFunction`], to build once per row and share across layers.
 
     Args:
         cu_seqlens: `(S + 1,)` segment boundaries of the packed row (TRL's `tree_cu_seqlens_q`).
         parents: `(S,)` parent segment of each segment, `-1` for a root (TRL's `tree_segment_parents`). Segments must be
             numbered in DFS pre-order and laid out in that order, so `parents[s] < s`.
         n_tokens: tokens in the row. Pass it to avoid a host sync on `cu_seqlens[-1]`.
+        cp_group: split the row over this group by context parallelism (see the module docstring). Every rank passes the
+            whole row's tree and then its own contiguous `n_tokens / P` tokens of Q/K/V to the attention.
+        sp_group: split the row over this group by Ulysses sequence parallelism, with the same inputs as `cp_group`.
     """
+    if cp_group is not None and sp_group is not None:
+        raise ValueError("pass one of cp_group and sp_group")
     cu_seqlens = cu_seqlens.to(torch.int32).contiguous()
     parents = parents.to(torch.int32).contiguous()
     n_segments = parents.numel()
@@ -172,12 +200,29 @@ def build_tree_attention_metadata(
     segment = torch.searchsorted(cu_seqlens, tokens, right=True) - 1
     positions = (pos_start[segment] + tokens - cu_seqlens[segment]).to(torch.int32)
 
+    tiles = tuple(_segment_tiles(cu_seqlens, block, 0, n_tokens) for block in BLOCK_T_SIZES)
+    query_start, query_tiles = 0, None
+    group = cp_group if cp_group is not None else sp_group
+    if group is not None:
+        world, rank = torch.distributed.get_world_size(group), torch.distributed.get_rank(group)
+        if n_tokens % world != 0:
+            raise ValueError(f"a row of {n_tokens} tokens does not split evenly over {world} ranks; pad it")
+        if cp_group is not None:
+            shard = n_tokens // world
+            query_start = rank * shard
+            query_tiles = tuple(
+                _segment_tiles(cu_seqlens, block, query_start, query_start + shard) for block in BLOCK_T_SIZES
+            )
     return TreeAttentionMetadata(
         cu_seqlens=cu_seqlens,
         parents=parents,
         subtree_end=subtree_end,
         positions=positions,
-        tiles=tuple(_segment_tiles(cu_seqlens, n_tokens, block) for block in BLOCK_T_SIZES),
+        tiles=tiles,
+        query_start=query_start,
+        query_tiles=query_tiles,
+        cp_group=cp_group,
+        sp_group=sp_group,
     )
 
 
@@ -330,7 +375,7 @@ def _fwd_inner(
     return acc, l_i, m_i
 
 
-@triton.jit(do_not_specialize=["window", "N_BUCKET"])
+@triton.jit(do_not_specialize=["window", "q_off", "q_end", "N_BUCKET"])
 def _tree_attn_fwd_kernel(
     Q,
     K,
@@ -356,6 +401,8 @@ def _tree_attn_fwd_kernel(
     stride_lse_h,
     qk_scale,
     window,
+    q_off,
+    q_end,
     N_BUCKET,
     G: tl.constexpr,
     HEAD_DIM: tl.constexpr,
@@ -366,6 +413,8 @@ def _tree_attn_fwd_kernel(
     BLOCK_T: tl.constexpr,
     BLOCK_S: tl.constexpr,
 ):
+    # Q, Out and LSE hold the queries [q_off, q_end) of the row (all of it without context parallelism); tokens are
+    # numbered in the row, so a query's row in them is its token - q_off
     BLOCK_M: tl.constexpr = BLOCK_T
     TILES = _pick_tiles(TILES32, TILES64, TILES128, BLOCK_T)
     tile = tl.program_id(0)
@@ -378,13 +427,15 @@ def _tree_attn_fwd_kernel(
     seg_start = tl.load(CU + seg)
     seg_end = tl.load(CU + seg + 1)
 
+    q_hi = tl.minimum(seg_end, q_end)
     offs_m = q_start + tl.arange(0, BLOCK_M)
-    m_mask = offs_m < seg_end
+    m_mask = offs_m < q_hi
+    rows = (offs_m - q_off).to(tl.int64)
     offs_d = tl.arange(0, BLOCK_D)
     d_mask = offs_d < HEAD_DIM
 
     q = tl.load(
-        Q + offs_m[:, None].to(tl.int64) * stride_qn + hq * stride_qh + offs_d[None, :],
+        Q + rows[:, None] * stride_qn + hq * stride_qh + offs_d[None, :],
         mask=m_mask[:, None] & d_mask[None, :],
         other=0.0,
     )
@@ -404,7 +455,7 @@ def _tree_attn_fwd_kernel(
     if USE_WINDOW:
         # positions are consecutive within a segment, so keys before q_start - window + 1 are never visible
         lo = tl.maximum(seg_start, q_start - window + 1)
-    hi = tl.minimum(q_start + BLOCK_M, seg_end)
+    hi = tl.minimum(q_start + BLOCK_M, q_hi)
     acc, l_i, m_i = _fwd_inner(
         acc, l_i, m_i, q, pos_q, offs_m, K, V, K_desc, V_desc, h, POS, stride_kn, stride_vn, lo, hi, qk_scale,
         window, offs_d, d_mask, True, USE_WINDOW, USE_DESC, BLOCK_S, BLOCK_D, DOT_PRECISION,
@@ -436,12 +487,12 @@ def _tree_attn_fwd_kernel(
 
     acc = acc / l_i[:, None]
     tl.store(
-        Out + offs_m[:, None].to(tl.int64) * stride_on + hq * stride_oh + offs_d[None, :],
+        Out + rows[:, None] * stride_on + hq * stride_oh + offs_d[None, :],
         acc.to(Out.dtype.element_ty),
         mask=m_mask[:, None] & d_mask[None, :],
     )
     # log-sum-exp in raw score units: p = exp2((qk - lse) * qk_scale)
-    tl.store(LSE + hq * stride_lse_h + offs_m, m_i + tl.math.log2(l_i) / qk_scale, mask=m_mask)
+    tl.store(LSE + hq * stride_lse_h + rows, m_i + tl.math.log2(l_i) / qk_scale, mask=m_mask)
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -534,7 +585,7 @@ def _bwd_dq_inner(
     return dq, b, rho, r_sum
 
 
-@triton.jit(do_not_specialize=["window", "N_BUCKET"])
+@triton.jit(do_not_specialize=["window", "q_off", "q_end", "N_BUCKET"])
 def _tree_attn_bwd_dq_kernel(
     Q,
     K,
@@ -566,6 +617,8 @@ def _tree_attn_bwd_dq_kernel(
     sm_scale,
     qk_scale,
     window,
+    q_off,
+    q_end,
     N_BUCKET,
     G: tl.constexpr,
     HEAD_DIM: tl.constexpr,
@@ -577,6 +630,7 @@ def _tree_attn_bwd_dq_kernel(
     BLOCK_T: tl.constexpr,
     BLOCK_S: tl.constexpr,
 ):
+    # query-side tensors (Q, dO, dQ, LSE, delta, lambda) hold the queries [q_off, q_end), as in the forward
     BLOCK_M: tl.constexpr = BLOCK_T
     TILES = _pick_tiles(TILES32, TILES64, TILES128, BLOCK_T)
     tile = tl.program_id(0)
@@ -589,20 +643,20 @@ def _tree_attn_bwd_dq_kernel(
     seg_start = tl.load(CU + seg)
     seg_end = tl.load(CU + seg + 1)
 
+    q_hi = tl.minimum(seg_end, q_end)
     offs_m = q_start + tl.arange(0, BLOCK_M)
-    m_mask = offs_m < seg_end
+    m_mask = offs_m < q_hi
+    rows = (offs_m - q_off).to(tl.int64)
     offs_d = tl.arange(0, BLOCK_D)
     d_mask = offs_d < HEAD_DIM
     qd_mask = m_mask[:, None] & d_mask[None, :]
 
-    q = tl.load(
-        Q + offs_m[:, None].to(tl.int64) * stride_qn + hq * stride_qh + offs_d[None, :], mask=qd_mask, other=0.0
+    q = tl.load(Q + rows[:, None] * stride_qn + hq * stride_qh + offs_d[None, :], mask=qd_mask, other=0.0)
+    do = tl.load(DO + rows[:, None] * stride_don + hq * stride_doh + offs_d[None, :], mask=qd_mask, other=0.0).to(
+        Q.dtype.element_ty
     )
-    do = tl.load(
-        DO + offs_m[:, None].to(tl.int64) * stride_don + hq * stride_doh + offs_d[None, :], mask=qd_mask, other=0.0
-    ).to(Q.dtype.element_ty)
-    lse = tl.load(LSE + hq * stride_lse_h + offs_m, mask=m_mask, other=0.0)
-    delta = tl.load(DELTA + hq * stride_lse_h + offs_m, mask=m_mask, other=0.0)
+    lse = tl.load(LSE + hq * stride_lse_h + rows, mask=m_mask, other=0.0)
+    delta = tl.load(DELTA + hq * stride_lse_h + rows, mask=m_mask, other=0.0)
     if USE_WINDOW:
         pos_q = tl.load(POS + offs_m, mask=m_mask, other=0)
     else:
@@ -618,7 +672,7 @@ def _tree_attn_bwd_dq_kernel(
     lo = seg_start
     if USE_WINDOW:
         lo = tl.maximum(seg_start, q_start - window + 1)
-    hi = tl.minimum(q_start + BLOCK_M, seg_end)
+    hi = tl.minimum(q_start + BLOCK_M, q_hi)
     dq, b, rho, r_sum = _bwd_dq_inner(
         dq, b, rho, r_sum, q, do, lse, delta, pos_q, offs_m, K, V, K_desc, V_desc, h, POS, stride_kn, stride_vn, lo, hi,
         qk_scale, window, offs_d, d_mask, True, USE_WINDOW, ZERO_SUM, USE_DESC, BLOCK_S, BLOCK_D,
@@ -650,9 +704,9 @@ def _tree_attn_bwd_dq_kernel(
     if ZERO_SUM:
         lam = tl.where(r_sum > 0, rho / r_sum, 0.0)
         dq = dq - lam[:, None] * b
-        tl.store(LAMBDA + hq * stride_lse_h + offs_m, lam, mask=m_mask)
+        tl.store(LAMBDA + hq * stride_lse_h + rows, lam, mask=m_mask)
     tl.store(
-        DQ + offs_m[:, None].to(tl.int64) * stride_dqn + hq * stride_dqh + offs_d[None, :],
+        DQ + rows[:, None] * stride_dqn + hq * stride_dqh + offs_d[None, :],
         (dq * sm_scale).to(DQ.dtype.element_ty),
         mask=qd_mask,
     )
@@ -681,6 +735,7 @@ def _bwd_dkv_inner(
     stride_don,
     lo,
     hi,
+    q_off,
     qk_scale,
     window,
     offs_d,
@@ -696,11 +751,12 @@ def _bwd_dkv_inner(
     for start_m in range(lo, hi, BLOCK_M):
         offs_m = start_m + tl.arange(0, BLOCK_M)
         m_mask = offs_m < hi
-        q, do = _load_rows2(Q, DO, Q_desc, DO_desc, start_m, offs_m, m_mask, hq, offs_d, d_mask, stride_qn, stride_don,
-                            USE_DESC, BLOCK_M, BLOCK_D)  # fmt: skip
+        rows = offs_m - q_off
+        q, do = _load_rows2(Q, DO, Q_desc, DO_desc, start_m - q_off, rows, m_mask, hq, offs_d, d_mask, stride_qn,
+                            stride_don, USE_DESC, BLOCK_M, BLOCK_D)  # fmt: skip
         do = do.to(q.dtype)
-        lse = tl.load(LSE + offs_m, mask=m_mask, other=0.0)
-        delta = tl.load(DELTA + offs_m, mask=m_mask, other=0.0)
+        lse = tl.load(LSE + rows, mask=m_mask, other=0.0)
+        delta = tl.load(DELTA + rows, mask=m_mask, other=0.0)
 
         # transposed scores, [BLOCK_N, BLOCK_M]
         s = tl.dot(k, tl.trans(q), input_precision=DOT_PRECISION)
@@ -718,13 +774,13 @@ def _bwd_dkv_inner(
         dk = tl.dot(t, q, dk, input_precision=DOT_PRECISION)
         if ZERO_SUM:
             # C += r^T z with z = cast(lambda * Q), lambda as computed by the dQ pass
-            lam = tl.load(LAMBDA + offs_m, mask=m_mask, other=0.0)
+            lam = tl.load(LAMBDA + rows, mask=m_mask, other=0.0)
             z = (lam[:, None] * q.to(tl.float32)).to(q.dtype)
             c = tl.dot(r, z, c, input_precision=DOT_PRECISION)
     return dk, dv, c
 
 
-@triton.jit(do_not_specialize=["window", "N_BUCKET"])
+@triton.jit(do_not_specialize=["window", "q_off", "q_end", "N_BUCKET"])
 def _tree_attn_bwd_dkv_kernel(
     Q,
     K,
@@ -759,6 +815,8 @@ def _tree_attn_bwd_dkv_kernel(
     sm_scale,
     qk_scale,
     window,
+    q_off,
+    q_end,
     N_BUCKET,
     G: tl.constexpr,
     HEAD_DIM: tl.constexpr,
@@ -770,6 +828,7 @@ def _tree_attn_bwd_dkv_kernel(
     BLOCK_T: tl.constexpr,
     BLOCK_S: tl.constexpr,
 ):
+    # every K/V tile of the row, against only the queries [q_off, q_end) that the query-side tensors hold
     BLOCK_N: tl.constexpr = BLOCK_T
     TILES = _pick_tiles(TILES32, TILES64, TILES128, BLOCK_T)
     tile = tl.program_id(0)
@@ -796,6 +855,10 @@ def _tree_attn_bwd_dkv_kernel(
     else:
         pos_k = offs_n
         own_hi = seg_end
+    own_lo = tl.maximum(k_start, q_off)
+    own_hi = tl.minimum(own_hi, q_end)
+    sub_lo = tl.maximum(seg_end, q_off)
+    sub_end = tl.minimum(sub_end, q_end)
 
     dk = tl.zeros([BLOCK_N, BLOCK_D], dtype=tl.float32)
     dv = tl.zeros([BLOCK_N, BLOCK_D], dtype=tl.float32)
@@ -811,13 +874,13 @@ def _tree_attn_bwd_dkv_kernel(
         # own segment, causal: queries from the tile start on
         dk, dv, c = _bwd_dkv_inner(
             dk, dv, c, k, v, pos_k, offs_n, n_mask, Qh, DOh, Q_desc, DO_desc, hq, LSEh, DELTAh, LAMBDAh, POS, stride_qn,
-            stride_don, k_start, own_hi, qk_scale, window, offs_d, d_mask, True, USE_WINDOW, ZERO_SUM, USE_DESC,
+            stride_don, own_lo, own_hi, q_off, qk_scale, window, offs_d, d_mask, True, USE_WINDOW, ZERO_SUM, USE_DESC,
             BLOCK_S, BLOCK_D, DOT_PRECISION,
         )  # fmt: skip
         # descendants: one contiguous pre-order range, every query sees the whole segment
         dk, dv, c = _bwd_dkv_inner(
             dk, dv, c, k, v, pos_k, offs_n, n_mask, Qh, DOh, Q_desc, DO_desc, hq, LSEh, DELTAh, LAMBDAh, POS, stride_qn,
-            stride_don, seg_end, sub_end, qk_scale, window, offs_d, d_mask, False, USE_WINDOW, ZERO_SUM, USE_DESC,
+            stride_don, sub_lo, sub_end, q_off, qk_scale, window, offs_d, d_mask, False, USE_WINDOW, ZERO_SUM, USE_DESC,
             BLOCK_S, BLOCK_D, DOT_PRECISION,
         )  # fmt: skip
 
@@ -878,9 +941,13 @@ def _descriptors(*tensors):
     )
 
 
-def _grid(meta: TreeAttentionMetadata, heads: int):
-    n_tiles = dict(zip(BLOCK_T_SIZES, (t.shape[0] for t in meta.tiles)))
+def _grid(tiles: tuple, heads: int):
+    n_tiles = dict(zip(BLOCK_T_SIZES, (t.shape[0] for t in tiles)))
     return lambda config: (n_tiles[config["BLOCK_T"]], heads)
+
+
+def _query_tiles(meta: TreeAttentionMetadata) -> tuple:
+    return meta.tiles if meta.query_tiles is None else meta.query_tiles
 
 
 def tree_attention_forward(
@@ -892,19 +959,24 @@ def tree_attention_forward(
     window: Optional[int],
     output_dtype: Optional[torch.dtype] = None,
 ):
+    """
+    `q`: the queries of tokens `[meta.query_start, meta.query_start + len(q))` of the row; `k`, `v`: the whole row.
+    Returns `o` and the log-sum-exp `(H_q, len(q))` of those queries.
+    """
     n, hq, d = q.shape
-    h = k.shape[1]
+    n_row, h = k.shape[0], k.shape[1]
     block_d = triton.next_power_of_2(d)
     o = torch.empty(n, hq, d, dtype=output_dtype or q.dtype, device=q.device)
     lse = torch.empty(hq, n, dtype=torch.float32, device=q.device)
     use_desc, (k_desc, v_desc) = _descriptors(k, v)
+    tiles = _query_tiles(meta)
     with device_context(q.device):
-        _launcher(_tree_attn_fwd_kernel)[_grid(meta, hq)](
-            q, k, v, k_desc, v_desc, o, lse, meta.cu_seqlens, meta.parents, meta.positions, *meta.tiles,
+        _launcher(_tree_attn_fwd_kernel)[_grid(tiles, hq)](
+            q, k, v, k_desc, v_desc, o, lse, meta.cu_seqlens, meta.parents, meta.positions, *tiles,
             q.stride(0), q.stride(1), k.stride(0), k.stride(1), v.stride(0), v.stride(1), o.stride(0), o.stride(1),
-            lse.stride(0), sm_scale * LOG2E, window or 0, triton.next_power_of_2(n),
-            G=hq // h, HEAD_DIM=d, BLOCK_D=block_d, USE_WINDOW=window is not None, USE_DESC=use_desc,
-            DOT_PRECISION=_dot_precision(q.dtype),
+            lse.stride(0), sm_scale * LOG2E, window or 0, meta.query_start, meta.query_start + n,
+            triton.next_power_of_2(n_row), G=hq // h, HEAD_DIM=d, BLOCK_D=block_d, USE_WINDOW=window is not None,
+            USE_DESC=use_desc, DOT_PRECISION=_dot_precision(q.dtype),
         )  # fmt: skip
     return o, lse
 
@@ -920,9 +992,14 @@ def tree_attention_backward(
     sm_scale: float,
     window: Optional[int],
     zero_sum_correction: bool = True,
+    dkv_dtype: Optional[torch.dtype] = None,
 ):
+    """
+    Gradients for the queries of [`tree_attention_forward`]: `dq` of those queries, and `dk`, `dv` of the whole row from
+    those queries alone (in `dkv_dtype`, default `k.dtype`).
+    """
     n, hq, d = q.shape
-    h = k.shape[1]
+    n_row, h = k.shape[0], k.shape[1]
     block_d = triton.next_power_of_2(d)
     zero_sum = zero_sum_correction and q.dtype != torch.float32
     common = dict(
@@ -936,32 +1013,76 @@ def tree_attention_backward(
 
     delta = torch.empty_like(lse)
     dq = torch.empty_like(q, memory_format=torch.contiguous_format)
-    dk = torch.empty_like(k, memory_format=torch.contiguous_format)
-    dv = torch.empty_like(v, memory_format=torch.contiguous_format)
+    dk = torch.empty(k.shape, dtype=dkv_dtype or k.dtype, device=k.device)
+    dv = torch.empty(v.shape, dtype=dkv_dtype or v.dtype, device=v.device)
     lam = torch.empty_like(lse) if zero_sum else lse  # LAMBDA is never read without ZERO_SUM
     qk_scale = sm_scale * LOG2E
-    n_bucket = triton.next_power_of_2(n)
+    q_off, q_end = meta.query_start, meta.query_start + n
+    n_bucket = triton.next_power_of_2(n_row)
     use_desc_kv, (k_desc, v_desc) = _descriptors(k, v)
     use_desc_q, (q_desc, do_desc) = _descriptors(q, do)
+    query_tiles = _query_tiles(meta)
     with device_context(q.device):
         _bwd_preprocess_kernel[(triton.cdiv(n, 64), hq)](
             o, do, delta, o.stride(0), o.stride(1), do.stride(0), do.stride(1), delta.stride(0), n,
             HEAD_DIM=d, BLOCK_D=block_d, BLOCK_M=64,
         )  # fmt: skip
         # dQ first: it computes the zero-sum lambda that dK/dV reads
-        _launcher(_tree_attn_bwd_dq_kernel, "ZERO_SUM")[_grid(meta, hq)](
+        _launcher(_tree_attn_bwd_dq_kernel, "ZERO_SUM")[_grid(query_tiles, hq)](
             q, k, v, k_desc, v_desc, do, dq, lse, delta, lam, meta.cu_seqlens, meta.parents, meta.positions,
-            *meta.tiles, q.stride(0), q.stride(1), k.stride(0), k.stride(1), v.stride(0), v.stride(1), do.stride(0),
-            do.stride(1), dq.stride(0), dq.stride(1), lse.stride(0), sm_scale, qk_scale, window or 0, n_bucket,
-            USE_DESC=use_desc_kv, **common,
+            *query_tiles, q.stride(0), q.stride(1), k.stride(0), k.stride(1), v.stride(0), v.stride(1), do.stride(0),
+            do.stride(1), dq.stride(0), dq.stride(1), lse.stride(0), sm_scale, qk_scale, window or 0, q_off, q_end,
+            n_bucket, USE_DESC=use_desc_kv, **common,
         )  # fmt: skip
-        _launcher(_tree_attn_bwd_dkv_kernel, "ZERO_SUM")[_grid(meta, h)](
+        _launcher(_tree_attn_bwd_dkv_kernel, "ZERO_SUM")[_grid(meta.tiles, h)](
             q, k, v, do, q_desc, do_desc, dk, dv, lse, delta, lam, meta.cu_seqlens, meta.subtree_end, meta.positions,
             *meta.tiles, q.stride(0), q.stride(1), k.stride(0), k.stride(1), v.stride(0), v.stride(1), do.stride(0),
             do.stride(1), dk.stride(0), dk.stride(1), dv.stride(0), dv.stride(1), lse.stride(0), sm_scale, qk_scale,
-            window or 0, n_bucket, USE_DESC=use_desc_q, **common,
+            window or 0, q_off, q_end, n_bucket, USE_DESC=use_desc_q, **common,
         )  # fmt: skip
     return dq, dk, dv
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# context / sequence parallelism
+# ---------------------------------------------------------------------------------------------------------------------
+
+
+def _all_gather_tokens(x: torch.Tensor, group) -> torch.Tensor:
+    """`(n, H, D)` shards of the ranks, in rank order -> `(P * n, H, D)`."""
+    out = torch.empty(
+        (torch.distributed.get_world_size(group) * x.shape[0], *x.shape[1:]), dtype=x.dtype, device=x.device
+    )
+    torch.distributed.all_gather_into_tensor(out, x.contiguous(), group=group)
+    return out
+
+
+def _reduce_scatter_tokens(x: torch.Tensor, group) -> torch.Tensor:
+    """`(P * n, H, D)` partial sums -> this rank's `(n, H, D)` shard of their sum over the ranks."""
+    out = torch.empty(
+        (x.shape[0] // torch.distributed.get_world_size(group), *x.shape[1:]), dtype=x.dtype, device=x.device
+    )
+    torch.distributed.reduce_scatter_tensor(out, x.contiguous(), group=group)
+    return out
+
+
+def _tokens_to_heads(x: torch.Tensor, group) -> torch.Tensor:
+    """Ulysses all-to-all: `(n, H, D)` with every head of this rank's tokens -> `(P * n, H / P, D)`, its heads."""
+    world = torch.distributed.get_world_size(group)
+    n, heads, d = x.shape
+    send = x.reshape(n, world, heads // world, d).transpose(0, 1).contiguous()  # head group j goes to rank j
+    recv = torch.empty_like(send)
+    torch.distributed.all_to_all_single(recv, send, group=group)
+    return recv.view(world * n, heads // world, d)  # rank i's tokens come i-th, so the row is in order
+
+
+def _heads_to_tokens(x: torch.Tensor, group) -> torch.Tensor:
+    """The inverse of [`_tokens_to_heads`]: `(P * n, H / P, D)` -> `(n, H, D)`."""
+    world = torch.distributed.get_world_size(group)
+    n_row, heads, d = x.shape
+    recv = torch.empty_like(x, memory_format=torch.contiguous_format)
+    torch.distributed.all_to_all_single(recv, x.contiguous(), group=group)
+    return recv.view(world, n_row // world, heads, d).transpose(0, 1).reshape(n_row // world, world * heads, d)
 
 
 def _require_unit_inner_stride(x: torch.Tensor) -> torch.Tensor:
@@ -976,7 +1097,8 @@ class LigerTreeAttentionFunction(torch.autograd.Function):
         q: `(N, H_q, D)` queries of the packed row. Any strides with a unit last stride (e.g. a transposed HF view).
         k: `(N, H_kv, D)` keys, `H_q` a multiple of `H_kv`.
         v: `(N, H_kv, D)` values.
-        meta: [`TreeAttentionMetadata`] from [`build_tree_attention_metadata`].
+        meta: [`TreeAttentionMetadata`] from [`build_tree_attention_metadata`]. Built with a `cp_group` or `sp_group`,
+            `q`, `k`, `v` are this rank's `N / P` tokens of the row, and so is the output.
         sm_scale: softmax scale, `1 / sqrt(D)` when `None`.
         window: sliding window in tree positions (a key at depth `j` is visible from depth `i` when `i - j < window`).
         output_dtype: `q.dtype` (default) or `torch.float32`. An fp32 output is saved as is, so backward's
@@ -996,15 +1118,51 @@ class LigerTreeAttentionFunction(torch.autograd.Function):
         if sm_scale is None:
             sm_scale = 1.0 / math.sqrt(q.shape[-1])
         q, k, v = (_require_unit_inner_stride(x) for x in (q, k, v))
-        o, lse = tree_attention_forward(q, k, v, meta, sm_scale, window, output_dtype)
+        ctx.meta, ctx.sm_scale, ctx.window, ctx.kv_repeat = meta, sm_scale, window, 1
+
+        if meta.sp_group is not None:
+            world = torch.distributed.get_world_size(meta.sp_group)
+            if q.shape[1] % world != 0:
+                raise ValueError(f"{q.shape[1]} query heads do not split over {world} ranks")
+            if k.shape[1] % world != 0:
+                if world % k.shape[1] != 0:
+                    raise ValueError(f"{k.shape[1]} key/value heads neither split over nor divide {world} ranks")
+                # fewer key/value heads than ranks: each rank takes a copy of the one its query heads share
+                ctx.kv_repeat = world // k.shape[1]
+                k, v = (x.repeat_interleave(ctx.kv_repeat, dim=1) for x in (k, v))
+            q, k, v = (_tokens_to_heads(x, meta.sp_group) for x in (q, k, v))
+            o, lse = tree_attention_forward(q, k, v, meta, sm_scale, window, output_dtype)
+            ctx.save_for_backward(q, k, v, o, lse)
+            return _heads_to_tokens(o, meta.sp_group)
+
+        if meta.cp_group is not None:
+            # save the local shards only; backward gathers K/V again
+            k_row, v_row = (_all_gather_tokens(x, meta.cp_group) for x in (k, v))
+            o, lse = tree_attention_forward(q, k_row, v_row, meta, sm_scale, window, output_dtype)
+        else:
+            o, lse = tree_attention_forward(q, k, v, meta, sm_scale, window, output_dtype)
         ctx.save_for_backward(q, k, v, o, lse)
-        ctx.meta, ctx.sm_scale, ctx.window = meta, sm_scale, window
         return o
 
     @staticmethod
     @amp_custom_bwd
     def backward(ctx, do):
         q, k, v, o, lse = ctx.saved_tensors
+        meta = ctx.meta
         do = _require_unit_inner_stride(do)
-        dq, dk, dv = tree_attention_backward(do, q, k, v, o, lse, ctx.meta, ctx.sm_scale, ctx.window)
+        if meta.sp_group is not None:
+            do = _tokens_to_heads(do, meta.sp_group)
+            dq, dk, dv = tree_attention_backward(do, q, k, v, o, lse, meta, ctx.sm_scale, ctx.window)
+            dq, dk, dv = (_heads_to_tokens(x, meta.sp_group) for x in (dq, dk, dv))
+            if ctx.kv_repeat > 1:
+                dk, dv = (x.unflatten(1, (-1, ctx.kv_repeat)).sum(2) for x in (dk, dv))
+        elif meta.cp_group is not None:
+            k_row, v_row = (_all_gather_tokens(x, meta.cp_group) for x in (k, v))
+            # this rank's queries' share of the whole row's dK/dV, summed over the ranks in fp32
+            dq, dk, dv = tree_attention_backward(
+                do, q, k_row, v_row, o, lse, meta, ctx.sm_scale, ctx.window, dkv_dtype=torch.float32
+            )
+            dk, dv = (_reduce_scatter_tokens(x, meta.cp_group).to(k.dtype) for x in (dk, dv))
+        else:
+            dq, dk, dv = tree_attention_backward(do, q, k, v, o, lse, meta, ctx.sm_scale, ctx.window)
         return dq, dk, dv, None, None, None, None

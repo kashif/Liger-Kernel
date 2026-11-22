@@ -1,8 +1,11 @@
 import math
 import random
+import tempfile
 
 import pytest
 import torch
+import torch.distributed as dist
+import torch.multiprocessing as mp
 import torch.nn.functional as F
 import triton
 
@@ -14,6 +17,7 @@ from liger_kernel.ops.tree_attention import LigerTreeAttentionFunction
 from liger_kernel.ops.tree_attention import build_tree_attention_metadata
 from liger_kernel.ops.tree_attention import tree_attention_backward
 from liger_kernel.ops.tree_attention import tree_attention_forward
+from liger_kernel.utils import infer_comm_backend
 from liger_kernel.utils import infer_device
 
 device = infer_device()
@@ -119,6 +123,22 @@ def relative_error(x, reference):
     return ((x.double() - reference).norm() / reference.norm().clamp_min(0.1 * reference.numel() ** 0.5)).item()
 
 
+def fp64_reference(cu, parents, q, k, v, do, scale, window=None):
+    """Output and input gradients of fp64 dense-mask attention over the tree."""
+    mask, _ = tree_mask(cu, parents, window)
+    reference = [x.detach().double().requires_grad_() for x in (q, k, v)]
+    out = masked_attention(*reference, mask.to(device), scale)
+    out.backward(do.double())
+    return [out.detach()] + [x.grad for x in reference]
+
+
+def assert_matches_fp64(actual, expected, dtype):
+    """`actual` and `expected`: output, dq, dk, dv."""
+    for name, x, ref in zip(("o", "dq", "dk", "dv"), actual, expected):
+        error = relative_error(x, ref)
+        assert error < TOLERANCE[dtype], f"{name}: relative error {error:.2e} >= {TOLERANCE[dtype]:.0e}"
+
+
 def check_against_fp64(
     cu, parents, hq, hkv, head_dim, dtype, window=None, hf_layout=False, key_offset=2.0, output_dtype=None
 ):
@@ -129,22 +149,14 @@ def check_against_fp64(
     meta = build_tree_attention_metadata(
         torch.tensor(cu, device=device), torch.tensor(parents, device=device), n_tokens=n_tokens
     )
-    mask, positions = tree_mask(cu, parents, window)
-    assert meta.positions.tolist() == positions.tolist()
+    assert meta.positions.tolist() == tree_mask(cu, parents)[1].tolist()
 
     inputs = [x.detach().requires_grad_() for x in (q, k, v)]
     actual = LigerTreeAttentionFunction.apply(*inputs, meta, scale, window, output_dtype)
     assert actual.dtype == (output_dtype or dtype)
     actual.backward(do.to(actual.dtype))
-    reference = [x.detach().double().requires_grad_() for x in (q, k, v)]
-    expected = masked_attention(*reference, mask.to(device), scale)
-    expected.backward(do.double())
-
-    for name, x, ref in [("o", actual, expected.detach())] + [
-        (name, x.grad, ref.grad) for name, x, ref in zip(("dq", "dk", "dv"), inputs, reference)
-    ]:
-        error = relative_error(x, ref)
-        assert error < TOLERANCE[dtype], f"{name}: relative error {error:.2e} >= {TOLERANCE[dtype]:.0e}"
+    expected = fp64_reference(cu, parents, q, k, v, do, scale, window)
+    assert_matches_fp64([actual] + [x.grad for x in inputs], expected, dtype)
 
 
 @pytest.mark.parametrize(
@@ -354,3 +366,64 @@ def test_every_autotune_config_matches_fp64(config, monkeypatch):
         check_against_fp64(*random_tree(12, 90, seed=12), hq=8, hkv=2, head_dim=128, dtype=dtype)
     except triton.runtime.errors.OutOfResources:
         pytest.skip(f"{config} does not fit this GPU; the autotuner skips it too")
+
+
+def _sequence_parallel_worker(rank, world_size, mode, hq, hkv, window, file_name):
+    """One rank of a row split over `world_size` ranks: its shard's output and gradients, gathered, vs fp64."""
+    device_count = getattr(torch, device).device_count()
+    getattr(torch, device).set_device(rank % device_count)
+    # gloo when there are fewer devices than ranks: it moves CUDA tensors through the host, so ranks can share a GPU
+    backend = infer_comm_backend() if device_count >= world_size else "gloo"
+    dist.init_process_group(backend, init_method=f"file://{file_name}", rank=rank, world_size=world_size)
+    try:
+        cu, parents = random_tree(12, 90, seed=world_size)
+        if cu[-1] % world_size:  # pad the row with a root segment to split it evenly
+            cu.append(cu[-1] + world_size - cu[-1] % world_size)
+            parents.append(-1)
+        n_tokens, head_dim = cu[-1], 64
+        scale = 1.0 / math.sqrt(head_dim)
+        group = dist.group.WORLD
+        meta = build_tree_attention_metadata(
+            torch.tensor(cu, device=device),
+            torch.tensor(parents, device=device),
+            n_tokens,
+            cp_group=group if mode == "cp" else None,
+            sp_group=group if mode == "sp" else None,
+        )
+        shard = slice(rank * n_tokens // world_size, (rank + 1) * n_tokens // world_size)
+
+        for dtype in [torch.float32] + ([torch.bfloat16] if supports_bfloat16() else []):
+            set_seed(0)  # the same row on every rank
+            q, k, v, do = make_inputs(n_tokens, hq, hkv, head_dim, dtype, key_offset=2.0)
+            inputs = [x[shard].detach().requires_grad_() for x in (q, k, v)]
+            out = LigerTreeAttentionFunction.apply(*inputs, meta, scale, window)
+            out.backward(do[shard])
+
+            actual = []
+            for x in [out.detach()] + [x.grad for x in inputs]:
+                row = x.new_empty(n_tokens, *x.shape[1:])
+                dist.all_gather_into_tensor(row, x.contiguous())
+                actual.append(row)
+            assert_matches_fp64(actual, fp64_reference(cu, parents, q, k, v, do, scale, window), dtype)
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.parametrize(
+    "mode, world_size, hq, hkv, window",
+    [
+        ("cp", 2, 8, 2, None),
+        ("cp", 4, 8, 2, 32),
+        ("sp", 2, 8, 2, None),
+        ("sp", 4, 8, 2, 32),  # fewer key/value heads than ranks: replicated
+    ],
+)
+def test_sequence_parallel_matches_fp64(mode, world_size, hq, hkv, window):
+    """Context parallel (all-gathered K/V) and Ulysses (all-to-all over heads) on a row split mid-segment."""
+    with tempfile.NamedTemporaryFile() as f:
+        mp.spawn(
+            _sequence_parallel_worker,
+            args=(world_size, mode, hq, hkv, window, f.name),
+            nprocs=world_size,
+            join=True,
+        )

@@ -13,6 +13,11 @@ it in for every attention layer of the model. It runs, from what the forward is 
 - a decoding step with a KV cache (one query token per row): plain attention over the cache, through SDPA.
 
 Padded batches are refused: pack them instead, as above.
+
+To split a long row over GPUs (context parallel, or Ulysses sequence parallel), build the row's metadata once with
+``build_tree_attention_metadata(cu_seqlens, parents, n_tokens, cp_group=...)`` (or ``sp_group=...``) from the whole
+row's tree, feed each rank its contiguous ``n_tokens / P`` tokens (``input_ids`` and tree ``position_ids``), and pass
+the metadata to the model as ``tree_attention_metadata``.
 """
 
 from typing import Optional
@@ -66,9 +71,9 @@ def liger_tree_attention_forward(
 
     Args:
         query, key, value: `(B, H, L, D)`; a packed row is one batch element.
-        tree_attention_metadata: a packed row's [`TreeAttentionMetadata`], to build once and share across layers.
-            Without it, it is built per layer from `tree_cu_seqlens_q` and `tree_segment_parents` (or `cu_seq_lens_q`),
-            on the GPU and without a host sync.
+        tree_attention_metadata: a packed row's [`TreeAttentionMetadata`], to build once and share across layers, and
+            needed to split the row over a `cp_group` / `sp_group`. Without it, it is built per layer from
+            `tree_cu_seqlens_q` and `tree_segment_parents` (or `cu_seq_lens_q`), on the GPU and without a host sync.
         scaling: softmax scale, `1 / sqrt(D)` when `None`.
         sliding_window: window in positions, as transformers passes it to FlashAttention.
 
