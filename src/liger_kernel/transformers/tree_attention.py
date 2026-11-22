@@ -89,8 +89,7 @@ def liger_tree_attention_forward(
     if s_aux is not None:
         raise NotImplementedError("liger tree attention does not support attention sinks")
     if attention_mask is not None and attention_mask.dim() == 2:
-        # a flash-attention style mask interface (as when loaded with `attn_implementation="<repo>:<function>"`)
-        # passes a 2D mask only for padded rows
+        # registered with a flash-attention style mask interface instead of ours, a 2D mask means padded rows
         raise NotImplementedError(_PADDED_BATCH_ERROR)
     batch, _, q_len, _ = query.shape
     if q_len != key.shape[2]:
