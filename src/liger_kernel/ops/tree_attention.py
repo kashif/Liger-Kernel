@@ -336,6 +336,9 @@ def _fwd_inner(
     POS,
     stride_kn,
     stride_vn,
+    k_lo,
+    k_hi,
+    kv_off,
     lo,
     hi,
     qk_scale,
@@ -349,11 +352,14 @@ def _fwd_inner(
     BLOCK_D: tl.constexpr,
     DOT_PRECISION: tl.constexpr,
 ):
+    # only keys in [k_lo, k_hi); K and V hold the row's keys from kv_off on
+    lo = tl.maximum(lo, k_lo)
+    hi = tl.minimum(hi, k_hi)
     for start_n in range(lo, hi, BLOCK_N):
         offs_n = start_n + tl.arange(0, BLOCK_N)
         n_mask = offs_n < hi
-        k, v = _load_rows2(K, V, K_desc, V_desc, start_n, offs_n, n_mask, h, offs_d, d_mask, stride_kn, stride_vn,
-                           USE_DESC, BLOCK_N, BLOCK_D)  # fmt: skip
+        k, v = _load_rows2(K, V, K_desc, V_desc, start_n - kv_off, offs_n - kv_off, n_mask, h, offs_d, d_mask,
+                           stride_kn, stride_vn, USE_DESC, BLOCK_N, BLOCK_D)  # fmt: skip
         # raw scores; the scale is applied after subtracting the max (subtract-before-scale)
         s = tl.dot(q, tl.trans(k), input_precision=DOT_PRECISION)
         valid = n_mask[None, :]
@@ -375,7 +381,7 @@ def _fwd_inner(
     return acc, l_i, m_i
 
 
-@triton.jit(do_not_specialize=["window", "q_off", "q_end", "N_BUCKET"])
+@triton.jit(do_not_specialize=["window", "q_off", "q_end", "k_lo", "k_hi", "kv_off", "N_BUCKET"])
 def _tree_attn_fwd_kernel(
     Q,
     K,
@@ -403,6 +409,9 @@ def _tree_attn_fwd_kernel(
     window,
     q_off,
     q_end,
+    k_lo,
+    k_hi,
+    kv_off,
     N_BUCKET,
     G: tl.constexpr,
     HEAD_DIM: tl.constexpr,
@@ -414,7 +423,8 @@ def _tree_attn_fwd_kernel(
     BLOCK_S: tl.constexpr,
 ):
     # Q, Out and LSE hold the queries [q_off, q_end) of the row (all of it without context parallelism); tokens are
-    # numbered in the row, so a query's row in them is its token - q_off
+    # numbered in the row, so a query's row in them is its token - q_off. Only keys in [k_lo, k_hi) are attended to
+    # (a part of the row, to merge with the rest by log-sum-exp), and K/V hold the row's keys from kv_off on.
     BLOCK_M: tl.constexpr = BLOCK_T
     TILES = _pick_tiles(TILES32, TILES64, TILES128, BLOCK_T)
     tile = tl.program_id(0)
@@ -457,7 +467,7 @@ def _tree_attn_fwd_kernel(
         lo = tl.maximum(seg_start, q_start - window + 1)
     hi = tl.minimum(q_start + BLOCK_M, q_hi)
     acc, l_i, m_i = _fwd_inner(
-        acc, l_i, m_i, q, pos_q, offs_m, K, V, K_desc, V_desc, h, POS, stride_kn, stride_vn, lo, hi, qk_scale,
+        acc, l_i, m_i, q, pos_q, offs_m, K, V, K_desc, V_desc, h, POS, stride_kn, stride_vn, k_lo, k_hi, kv_off, lo, hi, qk_scale,
         window, offs_d, d_mask, True, USE_WINDOW, USE_DESC, BLOCK_S, BLOCK_D, DOT_PRECISION,
     )  # fmt: skip
 
@@ -472,20 +482,21 @@ def _tree_attn_fwd_kernel(
                 a = -1
             else:
                 acc, l_i, m_i = _fwd_inner(
-                    acc, l_i, m_i, q, pos_q, offs_m, K, V, K_desc, V_desc, h, POS, stride_kn, stride_vn, a_start, a_end,
+                    acc, l_i, m_i, q, pos_q, offs_m, K, V, K_desc, V_desc, h, POS, stride_kn, stride_vn, k_lo, k_hi, kv_off, a_start, a_end,
                     qk_scale, window, offs_d, d_mask, False, USE_WINDOW, USE_DESC, BLOCK_S, BLOCK_D,
                     DOT_PRECISION,
                 )  # fmt: skip
                 a = tl.load(PARENTS + a)
         else:
             acc, l_i, m_i = _fwd_inner(
-                acc, l_i, m_i, q, pos_q, offs_m, K, V, K_desc, V_desc, h, POS, stride_kn, stride_vn, a_start, a_end,
+                acc, l_i, m_i, q, pos_q, offs_m, K, V, K_desc, V_desc, h, POS, stride_kn, stride_vn, k_lo, k_hi, kv_off, a_start, a_end,
                 qk_scale, window, offs_d, d_mask, False, USE_WINDOW, USE_DESC, BLOCK_S, BLOCK_D,
                 DOT_PRECISION,
             )  # fmt: skip
             a = tl.load(PARENTS + a)
 
-    acc = acc / l_i[:, None]
+    # a query with no key in [k_lo, k_hi) gets a zero output and a -inf log-sum-exp, so it merges as an empty part
+    acc = acc / tl.where(l_i == 0.0, 1.0, l_i)[:, None]
     tl.store(
         Out + rows[:, None] * stride_on + hq * stride_oh + offs_d[None, :],
         acc.to(Out.dtype.element_ty),
@@ -547,6 +558,9 @@ def _bwd_dq_inner(
     POS,
     stride_kn,
     stride_vn,
+    k_lo,
+    k_hi,
+    kv_off,
     lo,
     hi,
     qk_scale,
@@ -561,11 +575,14 @@ def _bwd_dq_inner(
     BLOCK_D: tl.constexpr,
     DOT_PRECISION: tl.constexpr,
 ):
+    # only keys in [k_lo, k_hi); K and V hold the row's keys from kv_off on
+    lo = tl.maximum(lo, k_lo)
+    hi = tl.minimum(hi, k_hi)
     for start_n in range(lo, hi, BLOCK_N):
         offs_n = start_n + tl.arange(0, BLOCK_N)
         n_mask = offs_n < hi
-        k, v = _load_rows2(K, V, K_desc, V_desc, start_n, offs_n, n_mask, h, offs_d, d_mask, stride_kn, stride_vn,
-                           USE_DESC, BLOCK_N, BLOCK_D)  # fmt: skip
+        k, v = _load_rows2(K, V, K_desc, V_desc, start_n - kv_off, offs_n - kv_off, n_mask, h, offs_d, d_mask,
+                           stride_kn, stride_vn, USE_DESC, BLOCK_N, BLOCK_D)  # fmt: skip
         s = tl.dot(q, tl.trans(k), input_precision=DOT_PRECISION)
         valid = n_mask[None, :]
         if CAUSAL:
@@ -585,7 +602,7 @@ def _bwd_dq_inner(
     return dq, b, rho, r_sum
 
 
-@triton.jit(do_not_specialize=["window", "q_off", "q_end", "N_BUCKET"])
+@triton.jit(do_not_specialize=["window", "q_off", "q_end", "k_lo", "k_hi", "kv_off", "N_BUCKET"])
 def _tree_attn_bwd_dq_kernel(
     Q,
     K,
@@ -597,6 +614,10 @@ def _tree_attn_bwd_dq_kernel(
     LSE,
     DELTA,
     LAMBDA,
+    DQ_ACC,
+    B_ACC,
+    RHO,
+    RSUM,
     CU,
     PARENTS,
     POS,
@@ -614,23 +635,33 @@ def _tree_attn_bwd_dq_kernel(
     stride_dqn,
     stride_dqh,
     stride_lse_h,
+    stride_acc_n,
+    stride_acc_h,
     sm_scale,
     qk_scale,
     window,
     q_off,
     q_end,
+    k_lo,
+    k_hi,
+    kv_off,
     N_BUCKET,
     G: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     BLOCK_D: tl.constexpr,
     USE_WINDOW: tl.constexpr,
     ZERO_SUM: tl.constexpr,
+    ACC_IN: tl.constexpr,
+    ACC_OUT: tl.constexpr,
     USE_DESC: tl.constexpr,
     DOT_PRECISION: tl.constexpr,
     BLOCK_T: tl.constexpr,
     BLOCK_S: tl.constexpr,
 ):
-    # query-side tensors (Q, dO, dQ, LSE, delta, lambda) hold the queries [q_off, q_end), as in the forward
+    # query-side tensors (Q, dO, dQ, LSE, delta, lambda) hold the queries [q_off, q_end), as in the forward. Keys are
+    # those in [k_lo, k_hi), from K/V rows kv_off on. Over keys split into passes, a pass with ACC_OUT leaves its fp32
+    # accumulators in DQ_ACC, B_ACC, RHO and RSUM and the next pass, with ACC_IN, continues from them: lambda needs the
+    # row sums over every key, so only the last pass projects and writes dQ.
     BLOCK_M: tl.constexpr = BLOCK_T
     TILES = _pick_tiles(TILES32, TILES64, TILES128, BLOCK_T)
     tile = tl.program_id(0)
@@ -668,13 +699,20 @@ def _tree_attn_bwd_dq_kernel(
     b = tl.zeros([BLOCK_M, BLOCK_D], dtype=tl.float32)  # r @ K, for the zero-sum projection
     rho = tl.zeros([BLOCK_M], dtype=tl.float32)  # row mass of the cast score gradient
     r_sum = tl.zeros([BLOCK_M], dtype=tl.float32)  # row mass of the cast probabilities
+    acc_offs = rows[:, None] * stride_acc_n + hq * stride_acc_h + offs_d[None, :]
+    if ACC_IN:
+        dq = tl.load(DQ_ACC + acc_offs, mask=qd_mask, other=0.0)
+        if ZERO_SUM:
+            b = tl.load(B_ACC + acc_offs, mask=qd_mask, other=0.0)
+            rho = tl.load(RHO + hq * stride_lse_h + rows, mask=m_mask, other=0.0)
+            r_sum = tl.load(RSUM + hq * stride_lse_h + rows, mask=m_mask, other=0.0)
 
     lo = seg_start
     if USE_WINDOW:
         lo = tl.maximum(seg_start, q_start - window + 1)
     hi = tl.minimum(q_start + BLOCK_M, q_hi)
     dq, b, rho, r_sum = _bwd_dq_inner(
-        dq, b, rho, r_sum, q, do, lse, delta, pos_q, offs_m, K, V, K_desc, V_desc, h, POS, stride_kn, stride_vn, lo, hi,
+        dq, b, rho, r_sum, q, do, lse, delta, pos_q, offs_m, K, V, K_desc, V_desc, h, POS, stride_kn, stride_vn, k_lo, k_hi, kv_off, lo, hi,
         qk_scale, window, offs_d, d_mask, True, USE_WINDOW, ZERO_SUM, USE_DESC, BLOCK_S, BLOCK_D,
         DOT_PRECISION,
     )  # fmt: skip
@@ -689,18 +727,25 @@ def _tree_attn_bwd_dq_kernel(
             else:
                 dq, b, rho, r_sum = _bwd_dq_inner(
                     dq, b, rho, r_sum, q, do, lse, delta, pos_q, offs_m, K, V, K_desc, V_desc, h, POS, stride_kn,
-                    stride_vn, a_start, a_end, qk_scale, window, offs_d, d_mask, False, USE_WINDOW, ZERO_SUM, USE_DESC,
+                    stride_vn, k_lo, k_hi, kv_off, a_start, a_end, qk_scale, window, offs_d, d_mask, False, USE_WINDOW, ZERO_SUM, USE_DESC,
                     BLOCK_S, BLOCK_D, DOT_PRECISION,
                 )  # fmt: skip
                 a = tl.load(PARENTS + a)
         else:
             dq, b, rho, r_sum = _bwd_dq_inner(
                 dq, b, rho, r_sum, q, do, lse, delta, pos_q, offs_m, K, V, K_desc, V_desc, h, POS, stride_kn,
-                stride_vn, a_start, a_end, qk_scale, window, offs_d, d_mask, False, USE_WINDOW, ZERO_SUM, USE_DESC,
+                stride_vn, k_lo, k_hi, kv_off, a_start, a_end, qk_scale, window, offs_d, d_mask, False, USE_WINDOW, ZERO_SUM, USE_DESC,
                 BLOCK_S, BLOCK_D, DOT_PRECISION,
             )  # fmt: skip
             a = tl.load(PARENTS + a)
 
+    if ACC_OUT:
+        tl.store(DQ_ACC + acc_offs, dq, mask=qd_mask)
+        if ZERO_SUM:
+            tl.store(B_ACC + acc_offs, b, mask=qd_mask)
+            tl.store(RHO + hq * stride_lse_h + rows, rho, mask=m_mask)
+            tl.store(RSUM + hq * stride_lse_h + rows, r_sum, mask=m_mask)
+        return
     if ZERO_SUM:
         lam = tl.where(r_sum > 0, rho / r_sum, 0.0)
         dq = dq - lam[:, None] * b
@@ -950,6 +995,25 @@ def _query_tiles(meta: TreeAttentionMetadata) -> tuple:
     return meta.tiles if meta.query_tiles is None else meta.query_tiles
 
 
+def _fwd_pass(q, k, v, meta, sm_scale, window, output_dtype, k_lo, k_hi, kv_off):
+    """Output and log-sum-exp of the queries `q` over the keys in `[k_lo, k_hi)`; `k`, `v` hold keys `kv_off` on."""
+    n, hq, d = q.shape
+    h = k.shape[1]
+    o = torch.empty(n, hq, d, dtype=output_dtype or q.dtype, device=q.device)
+    lse = torch.empty(hq, n, dtype=torch.float32, device=q.device)
+    use_desc, (k_desc, v_desc) = _descriptors(k, v)
+    tiles = _query_tiles(meta)
+    with device_context(q.device):
+        _launcher(_tree_attn_fwd_kernel)[_grid(tiles, hq)](
+            q, k, v, k_desc, v_desc, o, lse, meta.cu_seqlens, meta.parents, meta.positions, *tiles,
+            q.stride(0), q.stride(1), k.stride(0), k.stride(1), v.stride(0), v.stride(1), o.stride(0), o.stride(1),
+            lse.stride(0), sm_scale * LOG2E, window or 0, meta.query_start, meta.query_start + n, k_lo, k_hi, kv_off,
+            triton.next_power_of_2(meta.positions.shape[0]), G=hq // h, HEAD_DIM=d, BLOCK_D=triton.next_power_of_2(d),
+            USE_WINDOW=window is not None, USE_DESC=use_desc, DOT_PRECISION=_dot_precision(q.dtype),
+        )  # fmt: skip
+    return o, lse
+
+
 def tree_attention_forward(
     q,
     k,
@@ -963,22 +1027,83 @@ def tree_attention_forward(
     `q`: the queries of tokens `[meta.query_start, meta.query_start + len(q))` of the row; `k`, `v`: the whole row.
     Returns `o` and the log-sum-exp `(H_q, len(q))` of those queries.
     """
-    n, hq, d = q.shape
-    n_row, h = k.shape[0], k.shape[1]
-    block_d = triton.next_power_of_2(d)
-    o = torch.empty(n, hq, d, dtype=output_dtype or q.dtype, device=q.device)
-    lse = torch.empty(hq, n, dtype=torch.float32, device=q.device)
-    use_desc, (k_desc, v_desc) = _descriptors(k, v)
-    tiles = _query_tiles(meta)
-    with device_context(q.device):
-        _launcher(_tree_attn_fwd_kernel)[_grid(tiles, hq)](
-            q, k, v, k_desc, v_desc, o, lse, meta.cu_seqlens, meta.parents, meta.positions, *tiles,
-            q.stride(0), q.stride(1), k.stride(0), k.stride(1), v.stride(0), v.stride(1), o.stride(0), o.stride(1),
-            lse.stride(0), sm_scale * LOG2E, window or 0, meta.query_start, meta.query_start + n,
-            triton.next_power_of_2(n_row), G=hq // h, HEAD_DIM=d, BLOCK_D=block_d, USE_WINDOW=window is not None,
-            USE_DESC=use_desc, DOT_PRECISION=_dot_precision(q.dtype),
-        )  # fmt: skip
-    return o, lse
+    # in pre-order a query sees no later key, so keys past the last query are never visible
+    return _fwd_pass(q, k, v, meta, sm_scale, window, output_dtype, 0, meta.query_start + q.shape[0], 0)
+
+
+class _Backward:
+    """
+    The backward kernels of one call, for [`tree_attention_backward`] or split around communication: `preprocess`,
+    then `dq` over the keys in one or more passes, then `dkv`.
+    """
+
+    def __init__(self, do, q, o, lse, meta, sm_scale, window, h, zero_sum_correction=True):
+        self.do, self.q, self.lse, self.meta, self.sm_scale, self.window = do, q, lse, meta, sm_scale, window
+        n, hq, d = q.shape
+        self.zero_sum = zero_sum_correction and q.dtype != torch.float32
+        self.common = dict(
+            G=hq // h,
+            HEAD_DIM=d,
+            BLOCK_D=triton.next_power_of_2(d),
+            USE_WINDOW=window is not None,
+            ZERO_SUM=self.zero_sum,
+            DOT_PRECISION=_dot_precision(q.dtype),
+        )
+        self.q_off, self.q_end = meta.query_start, meta.query_start + n
+        self.n_bucket = triton.next_power_of_2(meta.positions.shape[0])
+        self.delta = torch.empty_like(lse)
+        self.dq = torch.empty_like(q, memory_format=torch.contiguous_format)
+        self.lam = torch.empty_like(lse) if self.zero_sum else lse  # LAMBDA is never read without ZERO_SUM
+        self.acc = None
+        with device_context(q.device):
+            _bwd_preprocess_kernel[(triton.cdiv(n, 64), hq)](
+                o, self.do, self.delta, o.stride(0), o.stride(1), self.do.stride(0), self.do.stride(1),
+                self.delta.stride(0), n, HEAD_DIM=d, BLOCK_D=self.common["BLOCK_D"], BLOCK_M=64,
+            )  # fmt: skip
+
+    def dq_pass(self, k, v, k_lo, k_hi, kv_off, last=True):
+        """dQ over the keys in `[k_lo, k_hi)` (`k`, `v` hold keys `kv_off` on), continuing the previous pass."""
+        q, do, dq, lse, meta, hq = self.q, self.do, self.dq, self.lse, self.meta, self.q.shape[1]
+        acc_in = self.acc is not None
+        if not last and self.acc is None:
+            fp32 = dict(dtype=torch.float32, device=q.device)
+            self.acc = (
+                torch.empty(q.shape, **fp32),
+                torch.empty(q.shape, **fp32) if self.zero_sum else lse,
+                torch.empty_like(lse) if self.zero_sum else lse,
+                torch.empty_like(lse) if self.zero_sum else lse,
+            )
+        dq_acc, b_acc, rho, r_sum = self.acc if self.acc is not None else (dq, dq, lse, lse)  # unread placeholders
+        use_desc, (k_desc, v_desc) = _descriptors(k, v)
+        tiles = _query_tiles(meta)
+        with device_context(q.device):
+            _launcher(_tree_attn_bwd_dq_kernel, "ZERO_SUM")[_grid(tiles, hq)](
+                q, k, v, k_desc, v_desc, do, dq, lse, self.delta, self.lam, dq_acc, b_acc, rho, r_sum,
+                meta.cu_seqlens, meta.parents, meta.positions, *tiles, q.stride(0), q.stride(1), k.stride(0),
+                k.stride(1), v.stride(0), v.stride(1), do.stride(0), do.stride(1), dq.stride(0), dq.stride(1),
+                lse.stride(0), dq_acc.stride(0), dq_acc.stride(1), self.sm_scale, self.sm_scale * LOG2E,
+                self.window or 0, self.q_off, self.q_end, k_lo, k_hi, kv_off, self.n_bucket, ACC_IN=acc_in,
+                ACC_OUT=not last, USE_DESC=use_desc, **self.common,
+            )  # fmt: skip
+        if last:
+            self.acc = None
+        return dq
+
+    def dkv(self, k, v, dkv_dtype=None):
+        """dK/dV of the whole row `k`, `v` from these queries alone (after the last dQ pass, whose lambda it reads)."""
+        q, do, lse, meta = self.q, self.do, self.lse, self.meta
+        dk = torch.empty(k.shape, dtype=dkv_dtype or k.dtype, device=k.device)
+        dv = torch.empty(v.shape, dtype=dkv_dtype or v.dtype, device=v.device)
+        use_desc, (q_desc, do_desc) = _descriptors(q, do)
+        with device_context(q.device):
+            _launcher(_tree_attn_bwd_dkv_kernel, "ZERO_SUM")[_grid(meta.tiles, k.shape[1])](
+                q, k, v, do, q_desc, do_desc, dk, dv, lse, self.delta, self.lam, meta.cu_seqlens, meta.subtree_end,
+                meta.positions, *meta.tiles, q.stride(0), q.stride(1), k.stride(0), k.stride(1), v.stride(0),
+                v.stride(1), do.stride(0), do.stride(1), dk.stride(0), dk.stride(1), dv.stride(0), dv.stride(1),
+                lse.stride(0), self.sm_scale, self.sm_scale * LOG2E, self.window or 0, self.q_off, self.q_end,
+                self.n_bucket, USE_DESC=use_desc, **self.common,
+            )  # fmt: skip
+        return dk, dv
 
 
 def tree_attention_backward(
@@ -998,63 +1123,28 @@ def tree_attention_backward(
     Gradients for the queries of [`tree_attention_forward`]: `dq` of those queries, and `dk`, `dv` of the whole row from
     those queries alone (in `dkv_dtype`, default `k.dtype`).
     """
-    n, hq, d = q.shape
-    n_row, h = k.shape[0], k.shape[1]
-    block_d = triton.next_power_of_2(d)
-    zero_sum = zero_sum_correction and q.dtype != torch.float32
-    common = dict(
-        G=hq // h,
-        HEAD_DIM=d,
-        BLOCK_D=block_d,
-        USE_WINDOW=window is not None,
-        ZERO_SUM=zero_sum,
-        DOT_PRECISION=_dot_precision(q.dtype),
-    )
-
-    delta = torch.empty_like(lse)
-    dq = torch.empty_like(q, memory_format=torch.contiguous_format)
-    dk = torch.empty(k.shape, dtype=dkv_dtype or k.dtype, device=k.device)
-    dv = torch.empty(v.shape, dtype=dkv_dtype or v.dtype, device=v.device)
-    lam = torch.empty_like(lse) if zero_sum else lse  # LAMBDA is never read without ZERO_SUM
-    qk_scale = sm_scale * LOG2E
-    q_off, q_end = meta.query_start, meta.query_start + n
-    n_bucket = triton.next_power_of_2(n_row)
-    use_desc_kv, (k_desc, v_desc) = _descriptors(k, v)
-    use_desc_q, (q_desc, do_desc) = _descriptors(q, do)
-    query_tiles = _query_tiles(meta)
-    with device_context(q.device):
-        _bwd_preprocess_kernel[(triton.cdiv(n, 64), hq)](
-            o, do, delta, o.stride(0), o.stride(1), do.stride(0), do.stride(1), delta.stride(0), n,
-            HEAD_DIM=d, BLOCK_D=block_d, BLOCK_M=64,
-        )  # fmt: skip
-        # dQ first: it computes the zero-sum lambda that dK/dV reads
-        _launcher(_tree_attn_bwd_dq_kernel, "ZERO_SUM")[_grid(query_tiles, hq)](
-            q, k, v, k_desc, v_desc, do, dq, lse, delta, lam, meta.cu_seqlens, meta.parents, meta.positions,
-            *query_tiles, q.stride(0), q.stride(1), k.stride(0), k.stride(1), v.stride(0), v.stride(1), do.stride(0),
-            do.stride(1), dq.stride(0), dq.stride(1), lse.stride(0), sm_scale, qk_scale, window or 0, q_off, q_end,
-            n_bucket, USE_DESC=use_desc_kv, **common,
-        )  # fmt: skip
-        _launcher(_tree_attn_bwd_dkv_kernel, "ZERO_SUM")[_grid(meta.tiles, h)](
-            q, k, v, do, q_desc, do_desc, dk, dv, lse, delta, lam, meta.cu_seqlens, meta.subtree_end, meta.positions,
-            *meta.tiles, q.stride(0), q.stride(1), k.stride(0), k.stride(1), v.stride(0), v.stride(1), do.stride(0),
-            do.stride(1), dk.stride(0), dk.stride(1), dv.stride(0), dv.stride(1), lse.stride(0), sm_scale, qk_scale,
-            window or 0, q_off, q_end, n_bucket, USE_DESC=use_desc_q, **common,
-        )  # fmt: skip
-    return dq, dk, dv
+    bwd = _Backward(do, q, o, lse, meta, sm_scale, window, k.shape[1], zero_sum_correction)
+    # dQ first: it computes the zero-sum lambda that dK/dV reads
+    dq = bwd.dq_pass(k, v, 0, bwd.q_end, 0)
+    return (dq, *bwd.dkv(k, v, dkv_dtype))
 
 
 # ---------------------------------------------------------------------------------------------------------------------
 # context / sequence parallelism
 # ---------------------------------------------------------------------------------------------------------------------
 
+# Context parallel: start the K/V all-gather, attend to this rank's own keys while it runs, then to the earlier ranks'
+# keys (in pre-order no query sees a later key), and merge the two by log-sum-exp; backward splits its dQ pass alike.
+_CP_OVERLAP = True
 
-def _all_gather_tokens(x: torch.Tensor, group) -> torch.Tensor:
-    """`(n, H, D)` shards of the ranks, in rank order -> `(P * n, H, D)`."""
+
+def _all_gather_tokens(x: torch.Tensor, group, async_op: bool = False):
+    """`(n, H, D)` shards of the ranks, in rank order -> `(P * n, H, D)` (and the work handle, with `async_op`)."""
     out = torch.empty(
         (torch.distributed.get_world_size(group) * x.shape[0], *x.shape[1:]), dtype=x.dtype, device=x.device
     )
-    torch.distributed.all_gather_into_tensor(out, x.contiguous(), group=group)
-    return out
+    work = torch.distributed.all_gather_into_tensor(out, x.contiguous(), group=group, async_op=async_op)
+    return (out, work) if async_op else out
 
 
 def _reduce_scatter_tokens(x: torch.Tensor, group) -> torch.Tensor:
@@ -1064,6 +1154,58 @@ def _reduce_scatter_tokens(x: torch.Tensor, group) -> torch.Tensor:
     )
     torch.distributed.reduce_scatter_tensor(out, x.contiguous(), group=group)
     return out
+
+
+def _gather_kv(k, v, group):
+    """Start gathering the row's K and V; returns them with a `wait` to call before reading them."""
+    (k_row, k_work), (v_row, v_work) = (_all_gather_tokens(x, group, async_op=True) for x in (k, v))
+
+    def wait():
+        k_work.wait()
+        v_work.wait()
+
+    return k_row, v_row, wait
+
+
+def _merge_parts(o1, lse1, o2, lse2, sm_scale, dtype):
+    """Attention over two disjoint key sets, as fp32 outputs and raw-unit log-sum-exps, merged into the one over both."""
+    lse1, lse2 = lse1 * sm_scale, lse2 * sm_scale  # natural units: p = exp((qk - lse) * sm_scale)
+    lse = torch.logaddexp(lse1, lse2)
+    o = o1 * torch.exp(lse1 - lse).T[..., None] + o2 * torch.exp(lse2 - lse).T[..., None]
+    return o.to(dtype), lse / sm_scale
+
+
+def _cp_forward(q, k, v, meta, sm_scale, window, output_dtype):
+    group = meta.cp_group
+    if not _CP_OVERLAP:
+        k_row, v_row = (_all_gather_tokens(x, group) for x in (k, v))
+        return tree_attention_forward(q, k_row, v_row, meta, sm_scale, window, output_dtype)
+    q_off, q_end = meta.query_start, meta.query_start + q.shape[0]
+    k_row, v_row, wait = _gather_kv(k, v, group)
+    o_own, lse_own = _fwd_pass(q, k, v, meta, sm_scale, window, torch.float32, q_off, q_end, q_off)
+    wait()
+    if q_off == 0:  # the first rank's queries see only its own keys
+        return o_own.to(output_dtype or q.dtype), lse_own
+    o_early, lse_early = _fwd_pass(q, k_row, v_row, meta, sm_scale, window, torch.float32, 0, q_off, 0)
+    return _merge_parts(o_own, lse_own, o_early, lse_early, sm_scale, output_dtype or q.dtype)
+
+
+def _cp_backward(do, q, k, v, o, lse, meta, sm_scale, window):
+    group = meta.cp_group
+    q_off, q_end = meta.query_start, meta.query_start + q.shape[0]
+    bwd = _Backward(do, q, o, lse, meta, sm_scale, window, k.shape[1])
+    if _CP_OVERLAP:
+        k_row, v_row, wait = _gather_kv(k, v, group)
+        dq = bwd.dq_pass(k, v, q_off, q_end, q_off, last=q_off == 0)
+        wait()
+        if q_off > 0:
+            dq = bwd.dq_pass(k_row, v_row, 0, q_off, 0)
+    else:
+        k_row, v_row = (_all_gather_tokens(x, group) for x in (k, v))
+        dq = bwd.dq_pass(k_row, v_row, 0, q_end, 0)
+    # this rank's queries' share of the whole row's dK/dV, summed over the ranks in fp32
+    dk, dv = bwd.dkv(k_row, v_row, torch.float32)
+    return (dq, *(_reduce_scatter_tokens(x, group).to(k.dtype) for x in (dk, dv)))
 
 
 def _tokens_to_heads(x: torch.Tensor, group) -> torch.Tensor:
@@ -1137,8 +1279,7 @@ class LigerTreeAttentionFunction(torch.autograd.Function):
 
         if meta.cp_group is not None:
             # save the local shards only; backward gathers K/V again
-            k_row, v_row = (_all_gather_tokens(x, meta.cp_group) for x in (k, v))
-            o, lse = tree_attention_forward(q, k_row, v_row, meta, sm_scale, window, output_dtype)
+            o, lse = _cp_forward(q, k, v, meta, sm_scale, window, output_dtype)
         else:
             o, lse = tree_attention_forward(q, k, v, meta, sm_scale, window, output_dtype)
         ctx.save_for_backward(q, k, v, o, lse)
@@ -1157,12 +1298,7 @@ class LigerTreeAttentionFunction(torch.autograd.Function):
             if ctx.kv_repeat > 1:
                 dk, dv = (x.unflatten(1, (-1, ctx.kv_repeat)).sum(2) for x in (dk, dv))
         elif meta.cp_group is not None:
-            k_row, v_row = (_all_gather_tokens(x, meta.cp_group) for x in (k, v))
-            # this rank's queries' share of the whole row's dK/dV, summed over the ranks in fp32
-            dq, dk, dv = tree_attention_backward(
-                do, q, k_row, v_row, o, lse, meta, ctx.sm_scale, ctx.window, dkv_dtype=torch.float32
-            )
-            dk, dv = (_reduce_scatter_tokens(x, meta.cp_group).to(k.dtype) for x in (dk, dv))
+            dq, dk, dv = _cp_backward(do, q, k, v, o, lse, meta, ctx.sm_scale, ctx.window)
         else:
             dq, dk, dv = tree_attention_backward(do, q, k, v, o, lse, meta, ctx.sm_scale, ctx.window)
         return dq, dk, dv, None, None, None, None

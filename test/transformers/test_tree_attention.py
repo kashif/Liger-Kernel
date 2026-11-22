@@ -132,11 +132,11 @@ def fp64_reference(cu, parents, q, k, v, do, scale, window=None):
     return [out.detach()] + [x.grad for x in reference]
 
 
-def assert_matches_fp64(actual, expected, dtype):
+def assert_matches_fp64(actual, expected, dtype, tolerance=TOLERANCE):
     """`actual` and `expected`: output, dq, dk, dv."""
     for name, x, ref in zip(("o", "dq", "dk", "dv"), actual, expected):
-        error = relative_error(x, ref)
-        assert error < TOLERANCE[dtype], f"{name}: relative error {error:.2e} >= {TOLERANCE[dtype]:.0e}"
+        error = relative_error(x, ref.double())
+        assert error < tolerance[dtype], f"{name}: relative error {error:.2e} >= {tolerance[dtype]:.0e}"
 
 
 def check_against_fp64(
@@ -368,6 +368,53 @@ def test_every_autotune_config_matches_fp64(config, monkeypatch):
         pytest.skip(f"{config} does not fit this GPU; the autotuner skips it too")
 
 
+def liger_outputs_and_grads(q, k, v, do, meta, scale, window, tokens=slice(None)):
+    inputs = [x[tokens].detach().requires_grad_() for x in (q, k, v)]
+    out = LigerTreeAttentionFunction.apply(*inputs, meta, scale, window)
+    out.backward(do[tokens])
+    return [out.detach()] + [x.grad for x in inputs]
+
+
+# Relative L2 distance between attention over keys split into two passes and one pass over all of them: the parts are
+# merged in fp32 and dQ carries its fp32 accumulators over, so they differ by accumulation order alone.
+SPLIT_TOLERANCE = {torch.float32: 1e-5, torch.float16: 2e-4, torch.bfloat16: 5e-4}
+
+
+@pytest.mark.parametrize("window", [None, 16])
+@pytest.mark.parametrize("dtype", DTYPES)
+def test_key_split_passes_match_one_pass(dtype, window):
+    """
+    Context parallel attends to a rank's own keys while the earlier ranks' are gathered, then to those, from K/V that
+    start at the rank's first token: merged by log-sum-exp (forward) or continued from fp32 accumulators (dQ, whose
+    zero-sum lambda needs every key), the two passes match one pass over all keys.
+    """
+    cu, parents = random_tree(12, 90, seed=5)
+    n_tokens, hkv = cu[-1], 2
+    split = n_tokens // 2 + 3  # mid-segment, off the tile grid
+    q, k, v, do = make_inputs(n_tokens, 8, hkv, 64, dtype, key_offset=2.0)
+    scale = 1.0 / math.sqrt(64)
+    meta = build_tree_attention_metadata(
+        torch.tensor(cu, device=device), torch.tensor(parents, device=device), n_tokens
+    )
+    own_k, own_v = k[split:], v[split:]
+
+    o, lse = tree_attention_forward(q, k, v, meta, scale, window)
+    own = tree_attention_ops._fwd_pass(q, own_k, own_v, meta, scale, window, torch.float32, split, n_tokens, split)
+    early = tree_attention_ops._fwd_pass(q, k, v, meta, scale, window, torch.float32, 0, split, 0)
+    o_split, lse_split = tree_attention_ops._merge_parts(*own, *early, scale, dtype)
+
+    one_pass = tree_attention_ops._Backward(do, q, o, lse, meta, scale, window, hkv)
+    dq = one_pass.dq_pass(k, v, 0, n_tokens, 0)
+    two_passes = tree_attention_ops._Backward(do, q, o, lse, meta, scale, window, hkv)
+    two_passes.dq_pass(own_k, own_v, split, n_tokens, split, last=False)
+    dq_split = two_passes.dq_pass(k, v, 0, split, 0)
+
+    assert_matches_fp64(
+        [o_split, dq_split, *two_passes.dkv(k, v)], [o, dq, *one_pass.dkv(k, v)], dtype, SPLIT_TOLERANCE
+    )
+    assert relative_error(lse_split, lse.double()) < 1e-6
+
+
 def _sequence_parallel_worker(rank, world_size, mode, hq, hkv, window, file_name):
     """One rank of a row split over `world_size` ranks: its shard's output and gradients, gathered, vs fp64."""
     device_count = getattr(torch, device).device_count()
@@ -392,20 +439,20 @@ def _sequence_parallel_worker(rank, world_size, mode, hq, hkv, window, file_name
         )
         shard = slice(rank * n_tokens // world_size, (rank + 1) * n_tokens // world_size)
 
-        for dtype in [torch.float32] + ([torch.bfloat16] if supports_bfloat16() else []):
+        dtypes = [torch.float32] + ([torch.bfloat16] if supports_bfloat16() else [])
+        # context parallel overlaps the K/V gather with the rank's own keys by default; check the plain gather too
+        for overlap, dtype in [(o, d) for o in ([True, False] if mode == "cp" else [True]) for d in dtypes]:
+            tree_attention_ops._CP_OVERLAP = overlap
             set_seed(0)  # the same row on every rank
             q, k, v, do = make_inputs(n_tokens, hq, hkv, head_dim, dtype, key_offset=2.0)
-            inputs = [x[shard].detach().requires_grad_() for x in (q, k, v)]
-            out = LigerTreeAttentionFunction.apply(*inputs, meta, scale, window)
-            out.backward(do[shard])
-
             actual = []
-            for x in [out.detach()] + [x.grad for x in inputs]:
+            for x in liger_outputs_and_grads(q, k, v, do, meta, scale, window, shard):
                 row = x.new_empty(n_tokens, *x.shape[1:])
                 dist.all_gather_into_tensor(row, x.contiguous())
                 actual.append(row)
             assert_matches_fp64(actual, fp64_reference(cu, parents, q, k, v, do, scale, window), dtype)
     finally:
+        tree_attention_ops._CP_OVERLAP = True
         dist.destroy_process_group()
 
 
