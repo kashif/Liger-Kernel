@@ -440,8 +440,8 @@ def _sequence_parallel_worker(rank, world_size, mode, hq, hkv, window, file_name
         shard = slice(rank * n_tokens // world_size, (rank + 1) * n_tokens // world_size)
 
         dtypes = [torch.float32] + ([torch.bfloat16] if supports_bfloat16() else [])
-        # context parallel overlaps the K/V gather with the rank's own keys by default; check the plain gather too
-        for overlap, dtype in [(o, d) for o in ([True, False] if mode == "cp" else [True]) for d in dtypes]:
+        # context parallel: the plain K/V gather (the default) and the one overlapped with the rank's own keys
+        for overlap, dtype in [(o, d) for o in ([False, True] if mode == "cp" else [False]) for d in dtypes]:
             tree_attention_ops._CP_OVERLAP = overlap
             set_seed(0)  # the same row on every rank
             q, k, v, do = make_inputs(n_tokens, hq, hkv, head_dim, dtype, key_offset=2.0)
@@ -452,7 +452,7 @@ def _sequence_parallel_worker(rank, world_size, mode, hq, hkv, window, file_name
                 actual.append(row)
             assert_matches_fp64(actual, fp64_reference(cu, parents, q, k, v, do, scale, window), dtype)
     finally:
-        tree_attention_ops._CP_OVERLAP = True
+        tree_attention_ops._CP_OVERLAP = False
         dist.destroy_process_group()
 
 

@@ -1133,9 +1133,11 @@ def tree_attention_backward(
 # context / sequence parallelism
 # ---------------------------------------------------------------------------------------------------------------------
 
-# Context parallel: start the K/V all-gather, attend to this rank's own keys while it runs, then to the earlier ranks'
-# keys (in pre-order no query sees a later key), and merge the two by log-sum-exp; backward splits its dQ pass alike.
-_CP_OVERLAP = True
+# Context parallel with overlap: start the K/V all-gather, attend to this rank's own keys while it runs, then to the
+# earlier ranks' keys (in pre-order no query sees a later key), and merge the two by log-sum-exp; backward splits its
+# dQ pass alike. Off by default: over fast links the gather is short next to the attention, and the second pass, its
+# fp32 partials and the merge cost more time and memory than the overlap hides. It can pay off over slow links.
+_CP_OVERLAP = False
 
 
 def _all_gather_tokens(x: torch.Tensor, group, async_op: bool = False):

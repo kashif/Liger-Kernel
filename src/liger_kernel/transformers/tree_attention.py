@@ -33,6 +33,10 @@ from liger_kernel.ops.tree_attention import TreeAttentionMetadata
 from liger_kernel.ops.tree_attention import build_tree_attention_metadata
 
 LIGER_TREE_ATTENTION = "liger_tree"
+_PADDED_BATCH_ERROR = (
+    "liger tree attention does not support padded batches; pack them padding-free instead "
+    "(e.g. transformers' DataCollatorWithFlattening, or TRL's tree packing)"
+)
 
 
 def _row_metadata(query, kwargs, tree_attention_metadata):
@@ -84,6 +88,10 @@ def liger_tree_attention_forward(
         raise NotImplementedError("liger tree attention does not support attention logit softcapping")
     if s_aux is not None:
         raise NotImplementedError("liger tree attention does not support attention sinks")
+    if attention_mask is not None and attention_mask.dim() == 2:
+        # a flash-attention style mask interface (as when loaded with `attn_implementation="<repo>:<function>"`)
+        # passes a 2D mask only for padded rows
+        raise NotImplementedError(_PADDED_BATCH_ERROR)
     batch, _, q_len, _ = query.shape
     if q_len != key.shape[2]:
         if q_len == 1:  # a decoding step over a KV cache: the query sees every cached key
@@ -110,10 +118,7 @@ def liger_tree_attention_forward(
 def _no_mask(attention_mask: Optional[torch.Tensor] = None, **kwargs) -> None:
     """Visibility comes from the tree or the packing, so no mask is built; a padding mask cannot be honored."""
     if attention_mask is not None and attention_mask.dim() == 2 and not bool(attention_mask.all()):
-        raise NotImplementedError(
-            "liger tree attention does not support padded batches; pack them padding-free instead "
-            "(e.g. transformers' DataCollatorWithFlattening, or TRL's tree packing)"
-        )
+        raise NotImplementedError(_PADDED_BATCH_ERROR)
     return None
 
 
